@@ -19,7 +19,11 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
+parser.add_argument("--motion_file", type=str, default=None, help="Path to a local WBT motion .npz file, directory, or .txt manifest.")
+parser.add_argument("--registry_name", type=str, default=None, help="The name of the wandb motion registry.")
+parser.add_argument("--max_steps", type=int, default=None, help="Maximum number of replay steps before exiting.")
+parser.add_argument("--progress_interval", type=int, default=200, help="Print progress every N replay steps.")
+parser.add_argument("--skip_export", action="store_true", help="Skip ONNX export during play.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -35,6 +39,9 @@ sys.argv = [sys.argv[0]] + hydra_args
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+# AppLauncher can append internal Kit/livestream flags to sys.argv. Restore
+# the Hydra-only argv so those flags are not parsed as task overrides.
+sys.argv = [sys.argv[0]] + hydra_args
 
 """Rest everything follows."""
 
@@ -67,6 +74,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Play with RSL-RL agent."""
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    if args_cli.device is not None:
+        env_cfg.sim.device = args_cli.device
+        agent_cfg.device = args_cli.device
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -95,10 +105,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {run_path}/{file}")
         resume_path = f"./logs/rsl_rl/temp/{file}"
 
-        if args_cli.motion_file is not None:
-            print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-            env_cfg.commands.motion.motion_file = args_cli.motion_file
-
         art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
         if art is None:
             print("[WARN] No model artifact found in the run.")
@@ -109,6 +115,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+
+    if args_cli.registry_name is not None:
+        import wandb
+
+        registry_name = args_cli.registry_name
+        if ":" not in registry_name:
+            registry_name += ":latest"
+        artifact = wandb.Api().artifact(registry_name)
+        env_cfg.commands.motion.motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+        print(f"[INFO]: Using motion file from registry: {registry_name}")
+
+    if args_cli.motion_file is not None:
+        print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
+        env_cfg.commands.motion.motion_file = args_cli.motion_file
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -144,14 +164,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
-    export_motion_policy_as_onnx(
-        env.unwrapped,
-        ppo_runner.alg.policy,
-        normalizer=ppo_runner.obs_normalizer,
-        path=export_model_dir,
-        filename="policy.onnx",
-    )
-    attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
+    if not args_cli.skip_export:
+        actor_critic = getattr(ppo_runner.alg, "policy", getattr(ppo_runner.alg, "actor_critic", None))
+        export_motion_policy_as_onnx(
+            env.unwrapped,
+            actor_critic,
+            normalizer=ppo_runner.obs_normalizer,
+            path=export_model_dir,
+            filename="policy.onnx",
+        )
+        attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
     # reset environment
     obs, _ = env.get_observations()
     timestep = 0
@@ -163,8 +185,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
+        timestep += 1
+        if args_cli.progress_interval > 0 and timestep % args_cli.progress_interval == 0:
+            print(f"[INFO]: Played {timestep} steps", flush=True)
+        if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
+            print(f"[INFO]: Reached --max_steps={args_cli.max_steps}. Exiting.", flush=True)
+            break
         if args_cli.video:
-            timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break

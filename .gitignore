@@ -42,3 +42,12 @@ _build
 
 **/assets/
 artifacts/
+
+# Local datasets / generated training data
+LAFAN1_Retargeting_Dataset/
+PHUMA/
+PHUMA_wbt_motions/
+
+# Local editor/cache/temp folders
+.marscode/
+tmp/

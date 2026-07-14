@@ -10,6 +10,8 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
+import sys
 import numpy as np
 
 from isaaclab.app import AppLauncher
@@ -30,6 +32,12 @@ parser.add_argument(
 )
 parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
+parser.add_argument("--progress_interval", type=int, default=1000, help="Print conversion progress every N frames.")
+parser.add_argument(
+    "--exit_after_save",
+    action="store_true",
+    help="Exit after saving and uploading the converted motion. Useful for batch conversion.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -244,6 +252,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
     # --------------------------------------------------------------------------
 
     # Simulation loop
+    frame_count = 0
     while simulation_app.is_running():
         (
             (
@@ -285,6 +294,9 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
             log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
             log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
             log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
+            frame_count += 1
+            if args_cli.progress_interval > 0 and frame_count % args_cli.progress_interval == 0:
+                print(f"[INFO]: Converted {frame_count}/{motion.output_frames} frames", flush=True)
 
         if reset_flag and not file_saved:
             file_saved = True
@@ -309,6 +321,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
             logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY)
             run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
             print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
+            run.finish()
+            if args_cli.exit_after_save:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
 
 
 def main():

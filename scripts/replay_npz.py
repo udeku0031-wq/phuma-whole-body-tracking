@@ -9,14 +9,20 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 import numpy as np
+import sys
 import torch
 
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay converted motions.")
-parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
+motion_source = parser.add_mutually_exclusive_group(required=True)
+motion_source.add_argument("--registry_name", type=str, help="The name of the wandb motion registry.")
+motion_source.add_argument("--motion_file", type=str, help="Path to a local WBT motion .npz file.")
+parser.add_argument("--max_steps", type=int, default=None, help="Maximum replay steps before exiting.")
+parser.add_argument("--progress_interval", type=int, default=500, help="Print replay progress every N steps.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -67,26 +73,39 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
 
-    registry_name = args_cli.registry_name
-    if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
-        registry_name += ":latest"
-    import pathlib
+    if args_cli.registry_name is not None:
+        registry_name = args_cli.registry_name
+        if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
+            registry_name += ":latest"
+        import pathlib
 
-    import wandb
+        import wandb
 
-    api = wandb.Api()
-    artifact = api.artifact(registry_name)
-    motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+        api = wandb.Api()
+        artifact = api.artifact(registry_name)
+        motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+        print(f"[INFO]: Downloaded motion artifact: {registry_name}", flush=True)
+    else:
+        motion_file = args_cli.motion_file
+        print(f"[INFO]: Using local motion file: {motion_file}", flush=True)
+    print(f"[INFO]: Motion file: {motion_file}", flush=True)
 
     motion = MotionLoader(
         motion_file,
         torch.tensor([0], dtype=torch.long, device=sim.device),
         sim.device,
     )
+    print(
+        f"[INFO]: Replay started. Motion steps: {motion.time_step_total}. "
+        "Press Ctrl+C to stop, or use --max_steps for a finite test.",
+        flush=True,
+    )
     time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
+    replay_steps = 0
 
     # Simulation loop
     while simulation_app.is_running():
+        replay_steps += 1
         time_steps += 1
         reset_ids = time_steps >= motion.time_step_total
         time_steps[reset_ids] = 0
@@ -105,6 +124,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
         pos_lookat = root_states[0, :3].cpu().numpy()
         sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
+
+        if args_cli.progress_interval > 0 and replay_steps % args_cli.progress_interval == 0:
+            print(f"[INFO]: Replayed {replay_steps} steps", flush=True)
+        if args_cli.max_steps is not None and replay_steps >= args_cli.max_steps:
+            print(f"[INFO]: Reached --max_steps={args_cli.max_steps}. Exiting.", flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
 
 def main():
