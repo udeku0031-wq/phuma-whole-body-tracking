@@ -23,6 +23,7 @@
 **/recordings/*
 **/output/*
 **/outputs/*
+results/
 **/videos/*
 **/wandb/*
 **/.neptune/*
@@ -46,7 +47,11 @@ artifacts/
 # Local datasets / generated training data
 LAFAN1_Retargeting_Dataset/
 PHUMA/
-PHUMA_wbt_motions/
+PHUMA_wbt_motions/*
+!PHUMA_wbt_motions/manifests/
+PHUMA_wbt_motions/manifests/*
+!PHUMA_wbt_motions/manifests/splits_v1/
+!PHUMA_wbt_motions/manifests/splits_v1/**
 
 # Local editor/cache/temp folders
 .marscode/

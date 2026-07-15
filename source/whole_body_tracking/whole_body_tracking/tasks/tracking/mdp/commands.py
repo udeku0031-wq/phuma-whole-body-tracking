@@ -98,7 +98,7 @@ class MotionLoader:
                     item = line.strip()
                     if not item or item.startswith("#"):
                         continue
-                    files.append(item if os.path.isabs(item) else os.path.join(base_dir, item))
+                    files.append(self._resolve_manifest_entry(item, base_dir))
         elif os.path.isfile(motion_path):
             files = [motion_path]
         else:
@@ -106,6 +106,20 @@ class MotionLoader:
         if not files:
             raise ValueError(f"No WBT .npz motion files found in {motion_path}")
         return files
+
+    @staticmethod
+    def _resolve_manifest_entry(item: str, base_dir: str) -> str:
+        if os.path.isabs(item):
+            return item
+
+        candidates = [
+            os.path.join(base_dir, item),
+            os.path.abspath(item),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return candidates[0]
 
     def _load_npz(self, motion_file: str) -> dict[str, np.ndarray | float | int | str]:
         loaded = np.load(motion_file, allow_pickle=True)
@@ -432,47 +446,47 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_top1_prob"][:] = pmax
         self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
 
-    def _resample_command(self, env_ids: Sequence[int]):
+    def _write_current_motion_state_to_sim(self, env_ids: Sequence[int], randomize: bool = True) -> None:
         if len(env_ids) == 0:
             return
-        self._adaptive_sampling(env_ids)
 
         root_pos = self.body_pos_w[:, 0].clone()
         root_ori = self.body_quat_w[:, 0].clone()
         root_lin_vel = self.body_lin_vel_w[:, 0].clone()
         root_ang_vel = self.body_ang_vel_w[:, 0].clone()
 
-        range_list = [self.cfg.pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
-        ranges = torch.tensor(range_list, device=self.device)
-        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
-        root_pos[env_ids] += rand_samples[:, 0:3]
-        orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
-        root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
-        range_list = [self.cfg.velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
-        ranges = torch.tensor(range_list, device=self.device)
-        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
-        root_lin_vel[env_ids] += rand_samples[:, :3]
-        root_ang_vel[env_ids] += rand_samples[:, 3:]
+        if randomize:
+            range_list = [self.cfg.pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+            ranges = torch.tensor(range_list, device=self.device)
+            rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
+            root_pos[env_ids] += rand_samples[:, 0:3]
+            orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
+            root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
+            range_list = [
+                self.cfg.velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]
+            ]
+            ranges = torch.tensor(range_list, device=self.device)
+            rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
+            root_lin_vel[env_ids] += rand_samples[:, :3]
+            root_ang_vel[env_ids] += rand_samples[:, 3:]
 
         joint_pos = self.joint_pos.clone()
         joint_vel = self.joint_vel.clone()
 
-        joint_pos += sample_uniform(*self.cfg.joint_position_range, joint_pos.shape, joint_pos.device)
-        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
-        joint_pos[env_ids] = torch.clip(
-            joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
-        )
+        if randomize:
+            joint_pos += sample_uniform(*self.cfg.joint_position_range, joint_pos.shape, joint_pos.device)
+            soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
+            joint_pos[env_ids] = torch.clip(
+                joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
+            )
+
         self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
         self.robot.write_root_state_to_sim(
             torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
             env_ids=env_ids,
         )
 
-    def _update_command(self):
-        self.time_steps += 1
-        env_ids = torch.where(self.time_steps >= self.motion.motion_lengths[self.motion_ids])[0]
-        self._resample_command(env_ids)
-
+    def _update_relative_body_targets(self) -> None:
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
         anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
         robot_anchor_pos_w_repeat = self.robot_anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -484,6 +498,54 @@ class MotionCommand(CommandTerm):
 
         self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
         self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
+
+    def set_eval_motion_state(
+        self,
+        env_ids: Sequence[int] | torch.Tensor,
+        motion_ids: Sequence[int] | torch.Tensor,
+        time_steps: Sequence[int] | torch.Tensor | None = None,
+    ) -> None:
+        """Assign exact motion frames for deterministic evaluation.
+
+        This bypasses adaptive sampling and reset randomization so an evaluator
+        can run each motion once from a known frame, usually frame zero.
+        """
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        motion_ids = torch.as_tensor(motion_ids, dtype=torch.long, device=self.device)
+        if time_steps is None:
+            time_steps = torch.zeros_like(motion_ids)
+        else:
+            time_steps = torch.as_tensor(time_steps, dtype=torch.long, device=self.device)
+
+        if env_ids.numel() != motion_ids.numel() or env_ids.numel() != time_steps.numel():
+            raise ValueError("env_ids, motion_ids, and time_steps must have the same length.")
+        if torch.any(motion_ids < 0) or torch.any(motion_ids >= self.motion.num_motions):
+            raise ValueError(f"motion_ids must be in [0, {self.motion.num_motions}).")
+
+        max_time_steps = self.motion.motion_lengths[motion_ids] - 1
+        self.motion_ids[env_ids] = motion_ids
+        self.time_steps[env_ids] = torch.clamp(time_steps, min=0)
+        self.time_steps[env_ids] = torch.minimum(self.time_steps[env_ids], max_time_steps)
+        self.time_left[env_ids] = 1.0e9
+        self.command_counter[env_ids] = 0
+
+        self._write_current_motion_state_to_sim(env_ids, randomize=False)
+        self._env.scene.write_data_to_sim()
+        self._env.sim.forward()
+        self._update_relative_body_targets()
+        self._update_metrics()
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        if len(env_ids) == 0:
+            return
+        self._adaptive_sampling(env_ids)
+        self._write_current_motion_state_to_sim(env_ids, randomize=True)
+
+    def _update_command(self):
+        self.time_steps += 1
+        env_ids = torch.where(self.time_steps >= self.motion.motion_lengths[self.motion_ids])[0]
+        self._resample_command(env_ids)
+        self._update_relative_body_targets()
 
         self.bin_failed_count = (
             self.cfg.adaptive_alpha * self._current_bin_failed + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count

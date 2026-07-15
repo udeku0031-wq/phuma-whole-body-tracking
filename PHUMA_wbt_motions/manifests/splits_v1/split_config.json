@@ -1,0 +1,39 @@
+{
+  "created_at": "2026-07-14T20:16:50.831884+00:00",
+  "data_root": "/home/l/whole_body_tracking_new/PHUMA_wbt_motions/g1_all",
+  "git_commit": "ffd18f01d17e0739f05fbdf5fe6b0bb843739b2e",
+  "invalid_npz_files": 0,
+  "normalization_rules": {
+    "does_not_strip_plain_trailing_digits": true,
+    "fallback": "converted npz path relative to data_root",
+    "keeps_parent_directories": true,
+    "source_file_priority": true,
+    "strip_suffixes": [
+      "_chunk_0000",
+      "_chunk0000",
+      "-chunk-0000",
+      "_clip_0000",
+      "_clip0000",
+      "-clip-0000",
+      "_segment_0000",
+      "_segment0000",
+      "-segment-0000",
+      "_part_0000",
+      "_part0000",
+      "-part-0000"
+    ]
+  },
+  "official_split_files": {},
+  "output_dir": "/home/l/whole_body_tracking_new/PHUMA_wbt_motions/manifests/splits_v1",
+  "path_mode": "relative",
+  "project_root": "/home/l/whole_body_tracking_new",
+  "seed": 42,
+  "split_mode_requested": "auto",
+  "split_mode_used": "grouped-random",
+  "split_version": "splits_v1",
+  "test_ratio": 0.1,
+  "total_npz_files": 76086,
+  "train_ratio": 0.8,
+  "val_ratio": 0.1,
+  "valid_npz_files": 76086
+}

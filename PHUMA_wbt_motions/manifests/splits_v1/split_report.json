@@ -1,0 +1,542 @@
+{
+  "category_distribution": {
+    "EgoBody": {
+      "splits": {
+        "test": {
+          "duration_sec": 815.6,
+          "files": 220,
+          "frames": 40780,
+          "source_groups": 64
+        },
+        "train": {
+          "duration_sec": 6218.36,
+          "files": 1681,
+          "frames": 310918,
+          "source_groups": 515
+        },
+        "validation": {
+          "duration_sec": 797.62,
+          "files": 215,
+          "frames": 39881,
+          "source_groups": 64
+        }
+      },
+      "total": {
+        "duration_sec": 7831.58,
+        "files": 2116,
+        "frames": 391579,
+        "source_groups": 643
+      }
+    },
+    "GRAB": {
+      "splits": {
+        "test": {
+          "duration_sec": 777.64,
+          "files": 199,
+          "frames": 38882,
+          "source_groups": 84
+        },
+        "train": {
+          "duration_sec": 5268.32,
+          "files": 1356,
+          "frames": 263416,
+          "source_groups": 671
+        },
+        "validation": {
+          "duration_sec": 674.1,
+          "files": 171,
+          "frames": 33705,
+          "source_groups": 84
+        }
+      },
+      "total": {
+        "duration_sec": 6720.06,
+        "files": 1726,
+        "frames": 336003,
+        "source_groups": 839
+      }
+    },
+    "LAFAN1": {
+      "splits": {
+        "test": {
+          "duration_sec": 1058.86,
+          "files": 268,
+          "frames": 52943,
+          "source_groups": 4
+        },
+        "train": {
+          "duration_sec": 6716.18,
+          "files": 1697,
+          "frames": 335809,
+          "source_groups": 32
+        },
+        "validation": {
+          "duration_sec": 996.52,
+          "files": 251,
+          "frames": 49826,
+          "source_groups": 4
+        }
+      },
+      "total": {
+        "duration_sec": 8771.56,
+        "files": 2216,
+        "frames": 438578,
+        "source_groups": 40
+      }
+    },
+    "LocoMuJoCo": {
+      "splits": {
+        "test": {
+          "duration_sec": 180.92,
+          "files": 46,
+          "frames": 9046,
+          "source_groups": 2
+        },
+        "train": {
+          "duration_sec": 2776.84,
+          "files": 702,
+          "frames": 138842,
+          "source_groups": 15
+        },
+        "validation": {
+          "duration_sec": 180.92,
+          "files": 46,
+          "frames": 9046,
+          "source_groups": 2
+        }
+      },
+      "total": {
+        "duration_sec": 3138.68,
+        "files": 794,
+        "frames": 156934,
+        "source_groups": 19
+      }
+    },
+    "aist": {
+      "splits": {
+        "test": {
+          "duration_sec": 620.0,
+          "files": 185,
+          "frames": 31000,
+          "source_groups": 77
+        },
+        "train": {
+          "duration_sec": 4702.28,
+          "files": 1379,
+          "frames": 235114,
+          "source_groups": 620
+        },
+        "validation": {
+          "duration_sec": 608.16,
+          "files": 181,
+          "frames": 30408,
+          "source_groups": 78
+        }
+      },
+      "total": {
+        "duration_sec": 5930.44,
+        "files": 1745,
+        "frames": 296522,
+        "source_groups": 775
+      }
+    },
+    "animation": {
+      "splits": {
+        "test": {
+          "duration_sec": 29.18,
+          "files": 10,
+          "frames": 1459,
+          "source_groups": 10
+        },
+        "train": {
+          "duration_sec": 252.66,
+          "files": 94,
+          "frames": 12633,
+          "source_groups": 83
+        },
+        "validation": {
+          "duration_sec": 30.2,
+          "files": 11,
+          "frames": 1510,
+          "source_groups": 11
+        }
+      },
+      "total": {
+        "duration_sec": 312.04,
+        "files": 115,
+        "frames": 15602,
+        "source_groups": 104
+      }
+    },
+    "custom": {
+      "splits": {
+        "test": {
+          "duration_sec": 46.72,
+          "files": 12,
+          "frames": 2336,
+          "source_groups": 1
+        },
+        "train": {
+          "duration_sec": 1735.7,
+          "files": 440,
+          "frames": 86785,
+          "source_groups": 13
+        },
+        "validation": {
+          "duration_sec": 280.14,
+          "files": 71,
+          "frames": 14007,
+          "source_groups": 2
+        }
+      },
+      "total": {
+        "duration_sec": 2062.56,
+        "files": 523,
+        "frames": 103128,
+        "source_groups": 16
+      }
+    },
+    "dance": {
+      "splits": {
+        "test": {
+          "duration_sec": 32.42,
+          "files": 9,
+          "frames": 1621,
+          "source_groups": 6
+        },
+        "train": {
+          "duration_sec": 335.21999999999997,
+          "files": 94,
+          "frames": 16761,
+          "source_groups": 49
+        },
+        "validation": {
+          "duration_sec": 46.62,
+          "files": 14,
+          "frames": 2331,
+          "source_groups": 6
+        }
+      },
+      "total": {
+        "duration_sec": 414.26,
+        "files": 117,
+        "frames": 20713,
+        "source_groups": 61
+      }
+    },
+    "fitness": {
+      "splits": {
+        "test": {
+          "duration_sec": 6827.5199999999995,
+          "files": 1955,
+          "frames": 341376,
+          "source_groups": 867
+        },
+        "train": {
+          "duration_sec": 55115.12,
+          "files": 15739,
+          "frames": 2755756,
+          "source_groups": 6936
+        },
+        "validation": {
+          "duration_sec": 6849.5,
+          "files": 1961,
+          "frames": 342475,
+          "source_groups": 867
+        }
+      },
+      "total": {
+        "duration_sec": 68792.14,
+        "files": 19655,
+        "frames": 3439607,
+        "source_groups": 8670
+      }
+    },
+    "game_motion": {
+      "splits": {
+        "test": {
+          "duration_sec": 2057.04,
+          "files": 623,
+          "frames": 102852,
+          "source_groups": 389
+        },
+        "train": {
+          "duration_sec": 16499.8,
+          "files": 5005,
+          "frames": 824990,
+          "source_groups": 3117
+        },
+        "validation": {
+          "duration_sec": 2001.48,
+          "files": 621,
+          "frames": 100074,
+          "source_groups": 390
+        }
+      },
+      "total": {
+        "duration_sec": 20558.32,
+        "files": 6249,
+        "frames": 1027916,
+        "source_groups": 3896
+      }
+    },
+    "haa500": {
+      "splits": {
+        "test": {
+          "duration_sec": 363.52,
+          "files": 178,
+          "frames": 18176,
+          "source_groups": 169
+        },
+        "train": {
+          "duration_sec": 2843.5,
+          "files": 1402,
+          "frames": 142175,
+          "source_groups": 1349
+        },
+        "validation": {
+          "duration_sec": 370.72,
+          "files": 183,
+          "frames": 18536,
+          "source_groups": 169
+        }
+      },
+      "total": {
+        "duration_sec": 3577.74,
+        "files": 1763,
+        "frames": 178887,
+        "source_groups": 1687
+      }
+    },
+    "humanml": {
+      "splits": {
+        "test": {
+          "duration_sec": 7339.82,
+          "files": 2142,
+          "frames": 366991,
+          "source_groups": 1089
+        },
+        "train": {
+          "duration_sec": 59685.2,
+          "files": 17395,
+          "frames": 2984260,
+          "source_groups": 8714
+        },
+        "validation": {
+          "duration_sec": 7578.76,
+          "files": 2194,
+          "frames": 378938,
+          "source_groups": 1089
+        }
+      },
+      "total": {
+        "duration_sec": 74603.78,
+        "files": 21731,
+        "frames": 3730189,
+        "source_groups": 10892
+      }
+    },
+    "humman": {
+      "splits": {
+        "test": {
+          "duration_sec": 182.04,
+          "files": 51,
+          "frames": 9102,
+          "source_groups": 25
+        },
+        "train": {
+          "duration_sec": 1333.86,
+          "files": 396,
+          "frames": 66693,
+          "source_groups": 205
+        },
+        "validation": {
+          "duration_sec": 171.3,
+          "files": 51,
+          "frames": 8565,
+          "source_groups": 26
+        }
+      },
+      "total": {
+        "duration_sec": 1687.2,
+        "files": 498,
+        "frames": 84360,
+        "source_groups": 256
+      }
+    },
+    "idea400": {
+      "splits": {
+        "test": {
+          "duration_sec": 3357.88,
+          "files": 1013,
+          "frames": 167894,
+          "source_groups": 559
+        },
+        "train": {
+          "duration_sec": 25946.84,
+          "files": 7935,
+          "frames": 1297342,
+          "source_groups": 4469
+        },
+        "validation": {
+          "duration_sec": 3235.92,
+          "files": 991,
+          "frames": 161796,
+          "source_groups": 559
+        }
+      },
+      "total": {
+        "duration_sec": 32540.64,
+        "files": 9939,
+        "frames": 1627032,
+        "source_groups": 5587
+      }
+    },
+    "kungfu": {
+      "splits": {
+        "test": {
+          "duration_sec": 741.34,
+          "files": 210,
+          "frames": 37067,
+          "source_groups": 75
+        },
+        "train": {
+          "duration_sec": 5455.56,
+          "files": 1522,
+          "frames": 272778,
+          "source_groups": 598
+        },
+        "validation": {
+          "duration_sec": 710.62,
+          "files": 201,
+          "frames": 35531,
+          "source_groups": 75
+        }
+      },
+      "total": {
+        "duration_sec": 6907.52,
+        "files": 1933,
+        "frames": 345376,
+        "source_groups": 748
+      }
+    },
+    "music": {
+      "splits": {
+        "test": {
+          "duration_sec": 954.74,
+          "files": 282,
+          "frames": 47737,
+          "source_groups": 127
+        },
+        "train": {
+          "duration_sec": 8585.1,
+          "files": 2501,
+          "frames": 429255,
+          "source_groups": 1018
+        },
+        "validation": {
+          "duration_sec": 1045.42,
+          "files": 305,
+          "frames": 52271,
+          "source_groups": 127
+        }
+      },
+      "total": {
+        "duration_sec": 10585.26,
+        "files": 3088,
+        "frames": 529263,
+        "source_groups": 1272
+      }
+    },
+    "perform": {
+      "splits": {
+        "test": {
+          "duration_sec": 694.02,
+          "files": 189,
+          "frames": 34701,
+          "source_groups": 62
+        },
+        "train": {
+          "duration_sec": 5533.06,
+          "files": 1520,
+          "frames": 276653,
+          "source_groups": 498
+        },
+        "validation": {
+          "duration_sec": 611.7,
+          "files": 169,
+          "frames": 30585,
+          "source_groups": 62
+        }
+      },
+      "total": {
+        "duration_sec": 6838.78,
+        "files": 1878,
+        "frames": 341939,
+        "source_groups": 622
+      }
+    }
+  },
+  "fallback_files": 0,
+  "integrity_checks": {
+    "duplicate_assigned_files": 0,
+    "extra_assigned_files": 0,
+    "file_intersections": {
+      "train_test": 0,
+      "train_validation": 0,
+      "validation_test": 0
+    },
+    "internal_manifest_duplicates": {
+      "test": 0,
+      "train": 0,
+      "validation": 0
+    },
+    "missing_existing_paths": 0,
+    "missing_manifest_paths": 0,
+    "ok": true,
+    "source_group_intersections": {
+      "train_test": 0,
+      "train_validation": 0,
+      "validation_test": 0
+    },
+    "source_group_leak_count": 0,
+    "source_group_leak_examples": {},
+    "unassigned_files": 0,
+    "unknown_manifest_paths": 0
+  },
+  "invalid_files": 0,
+  "official_mapping": {
+    "official_mapped_groups": 0,
+    "official_mapping_failures": 0,
+    "official_test_entries": 0,
+    "official_train_entries": 0,
+    "official_unseen_entries": 0
+  },
+  "split_file_counts": {
+    "test": 7592,
+    "train": 60858,
+    "validation": 7636
+  },
+  "split_file_ratios": {
+    "test": 0.09978182582866756,
+    "train": 0.7998580553584103,
+    "validation": 0.10036011881292221
+  },
+  "split_mode_used": "grouped-random",
+  "split_source_group_counts": {
+    "test": 3610,
+    "train": 28902,
+    "validation": 3615
+  },
+  "split_source_group_ratios": {
+    "test": 0.09992526365322335,
+    "train": 0.8000110720513743,
+    "validation": 0.10006366429540232
+  },
+  "total_files": 76086,
+  "total_source_groups": 36127,
+  "valid_files": 76086,
+  "warnings": [
+    "No PHUMA official split files found; falling back to grouped-random."
+  ]
+}

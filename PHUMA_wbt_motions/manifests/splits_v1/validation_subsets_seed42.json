@@ -1,0 +1,109 @@
+{
+  "created_at": "2026-07-15T04:58:29.447447+00:00",
+  "seed": 42,
+  "metadata_path": "PHUMA_wbt_motions/manifests/splits_v1/metadata.csv",
+  "validation": {
+    "num_chunks": 7636,
+    "num_source_groups": 3615,
+    "categories": {
+      "EgoBody": 215,
+      "GRAB": 171,
+      "LAFAN1": 251,
+      "LocoMuJoCo": 46,
+      "aist": 181,
+      "animation": 11,
+      "custom": 71,
+      "dance": 14,
+      "fitness": 1961,
+      "game_motion": 621,
+      "haa500": 183,
+      "humanml": 2194,
+      "humman": 51,
+      "idea400": 991,
+      "kungfu": 201,
+      "music": 305,
+      "perform": 169
+    },
+    "min_frames": 49,
+    "max_frames": 222
+  },
+  "smoke20": {
+    "num_chunks": 20,
+    "num_source_groups": 20,
+    "categories": {
+      "EgoBody": 1,
+      "GRAB": 1,
+      "LAFAN1": 1,
+      "LocoMuJoCo": 1,
+      "aist": 1,
+      "animation": 1,
+      "custom": 1,
+      "dance": 1,
+      "fitness": 2,
+      "game_motion": 1,
+      "haa500": 1,
+      "humanml": 3,
+      "humman": 1,
+      "idea400": 1,
+      "kungfu": 1,
+      "music": 1,
+      "perform": 1
+    },
+    "min_frames": 80,
+    "max_frames": 204
+  },
+  "probe500": {
+    "num_chunks": 500,
+    "num_source_groups": 500,
+    "categories": {
+      "EgoBody": 9,
+      "GRAB": 12,
+      "LAFAN1": 1,
+      "LocoMuJoCo": 1,
+      "aist": 11,
+      "animation": 1,
+      "custom": 1,
+      "dance": 1,
+      "fitness": 120,
+      "game_motion": 54,
+      "haa500": 23,
+      "humanml": 151,
+      "humman": 3,
+      "idea400": 77,
+      "kungfu": 10,
+      "music": 17,
+      "perform": 8
+    },
+    "min_frames": 49,
+    "max_frames": 222
+  },
+  "full": {
+    "num_chunks": 7636,
+    "num_source_groups": 3615,
+    "categories": {
+      "EgoBody": 215,
+      "GRAB": 171,
+      "LAFAN1": 251,
+      "LocoMuJoCo": 46,
+      "aist": 181,
+      "animation": 11,
+      "custom": 71,
+      "dance": 14,
+      "fitness": 1961,
+      "game_motion": 621,
+      "haa500": 183,
+      "humanml": 2194,
+      "humman": 51,
+      "idea400": 991,
+      "kungfu": 201,
+      "music": 305,
+      "perform": 169
+    },
+    "min_frames": 49,
+    "max_frames": 222
+  },
+  "notes": [
+    "smoke and probe contain at most one chunk per source_group",
+    "full contains every validation chunk"
+  ]
+}
