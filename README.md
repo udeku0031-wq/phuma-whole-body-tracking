@@ -111,6 +111,94 @@ python scripts/rsl_rl/train.py --task=Tracking-Flat-G1-v0 \
 --headless --logger wandb --log_project_name {project_name} --run_name {run_name}
 ```
 
+### PHUMA Baseline W&B Logging
+
+For PHUMA experiments, use the clean comparison project below so every new
+experiment is shown alongside the stitched Direct Mixed Training baseline:
+
+```text
+W&B entity/team: longxianli222-northeastern-university
+W&B project:     whole_body_tracking_phuma_baseline
+Baseline run:    baseline_direct_random6000_model33999_stitched
+```
+
+Recommended run naming:
+
+```text
+<method>_<trainset>_seed<seed>_env<num_envs>_<short_note>_v<version>
+```
+
+Examples:
+
+```text
+dmt_random6000_seed42_env3072_baseline_v1
+abt_nocurr_random6000_seed42_env3072_v1
+abt_topk_random6000_seed42_env3072_k4_v1
+```
+
+Use the same string for `--run_name`, `--wandb_run_name`, and
+`--wandb_run_id` unless there is a clear reason not to. Do not use spaces or
+Chinese characters in `--wandb_run_id`.
+
+Fresh training:
+
+```bash
+cd ~/whole_body_tracking_new
+conda activate hybrid_robot
+
+env -u PYTHONPATH -u LD_LIBRARY_PATH \
+  WANDB_USERNAME=longxianli222-northeastern-university \
+  WBT_DISABLE_ONNX_ON_SAVE=1 \
+python scripts/rsl_rl/train.py \
+  --task Tracking-Flat-G1-v0 \
+  --motion_file PHUMA_wbt_motions/manifests/experiments/random_seed42/random6000_seed42.txt \
+  --headless \
+  --logger wandb \
+  --log_project_name whole_body_tracking_phuma_baseline \
+  --run_name dmt_random6000_seed42_env3072_baseline_v1 \
+  --wandb_run_name dmt_random6000_seed42_env3072_baseline_v1 \
+  --wandb_run_id dmt_random6000_seed42_env3072_baseline_v1 \
+  --wandb_resume never \
+  --num_envs 3072 \
+  --seed 42 \
+  --max_iterations 34000
+```
+
+If training is interrupted, resume with the same W&B project, run name, and
+run id. Use `--wandb_resume must` so W&B refuses to create a new curve if the
+run id is wrong:
+
+```bash
+env -u PYTHONPATH -u LD_LIBRARY_PATH \
+  WANDB_USERNAME=longxianli222-northeastern-university \
+  WBT_DISABLE_ONNX_ON_SAVE=1 \
+python scripts/rsl_rl/train.py \
+  --task Tracking-Flat-G1-v0 \
+  --motion_file PHUMA_wbt_motions/manifests/experiments/random_seed42/random6000_seed42.txt \
+  --headless \
+  --logger wandb \
+  --log_project_name whole_body_tracking_phuma_baseline \
+  --run_name dmt_random6000_seed42_env3072_baseline_v1 \
+  --wandb_run_name dmt_random6000_seed42_env3072_baseline_v1 \
+  --wandb_run_id dmt_random6000_seed42_env3072_baseline_v1 \
+  --wandb_resume must \
+  --num_envs 3072 \
+  --seed 42 \
+  --resume True \
+  --load_run <LOCAL_LOG_RUN_DIR> \
+  --checkpoint model_<ITER>.pt \
+  --max_iterations <REMAINING_ITERATIONS>
+```
+
+Important resume rule: in the current RSL-RL runner, `--max_iterations` is the
+number of additional iterations to run after loading the checkpoint, not the
+final target iteration. For example, if `model_12000.pt` is resumed and the
+target is `34000`, use `--max_iterations 22000`.
+
+W&B storage rule: keep `WBT_DISABLE_ONNX_ON_SAVE=1` for routine training and do
+not set `WBT_ENABLE_WANDB_MODEL_SAVE=1` unless a cloud checkpoint upload is
+intentionally needed. Checkpoints remain saved locally under `logs/rsl_rl/...`.
+
 ### Policy Evaluation
 
 - Play the trained policy by the following command:

@@ -8,7 +8,10 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import json
+import os
 import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
@@ -49,9 +52,8 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import gymnasium as gym
-import os
 import torch
+import gymnasium as gym
 from datetime import datetime
 
 from isaaclab.envs import (
@@ -75,6 +77,87 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _count_manifest_entries(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return sum(1 for line in f if line.strip() and not line.lstrip().startswith("#"))
+    except OSError:
+        return None
+
+
+def _read_sampling_config(motion_file: str) -> dict:
+    config_path = Path(motion_file).resolve().parent / "sampling_config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        return json.loads(config_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _build_training_metadata(args_cli: argparse.Namespace, agent_cfg, env_cfg) -> dict:
+    motion_file = os.path.abspath(args_cli.motion_file) if args_cli.motion_file is not None else None
+    sampling_config = _read_sampling_config(motion_file) if motion_file is not None else {}
+    manifest_name = Path(motion_file).name if motion_file is not None else None
+    train_size = _count_manifest_entries(motion_file) if motion_file is not None and motion_file.endswith(".txt") else None
+    experiment_label = agent_cfg.run_name or args_cli.run_name or agent_cfg.experiment_name
+    metadata = {
+        "experiment_name": experiment_label,
+        "train_manifest": manifest_name,
+        "train_size": train_size,
+        "training_seed": agent_cfg.seed,
+        "num_envs": env_cfg.scene.num_envs,
+        "max_iterations": agent_cfg.max_iterations,
+        "resume": bool(agent_cfg.resume),
+        "curriculum": False,
+    }
+    if sampling_config.get("sampling_method") == "uniform_random_file_sampling":
+        metadata.update(
+            {
+                "training_strategy": "direct_mixed",
+                "sampling_method": sampling_config.get("sampling_method"),
+                "split_version": sampling_config.get("split_version"),
+                "train_pool_size": sampling_config.get("train_pool_size"),
+                "sampling_seed": sampling_config.get("seed"),
+            }
+        )
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
+def _update_wandb_config_if_active(metadata: dict) -> None:
+    try:
+        import wandb
+    except ImportError:
+        return
+    if wandb.run is not None:
+        wandb.config.update(metadata, allow_val_change=True)
+
+
+def _prepare_wandb_resume_env(args_cli: argparse.Namespace, agent_cfg) -> None:
+    """Expose stable W&B run identity to rsl_rl's WandbSummaryWriter."""
+    if agent_cfg.logger != "wandb":
+        return
+    if args_cli.wandb_run_id:
+        os.environ["WANDB_RUN_ID"] = args_cli.wandb_run_id
+    if args_cli.wandb_resume:
+        os.environ["WANDB_RESUME"] = args_cli.wandb_resume
+    run_name = args_cli.wandb_run_name or args_cli.run_name or agent_cfg.run_name
+    if run_name:
+        os.environ["WANDB_NAME"] = run_name
+
+
+def _update_wandb_name_if_active(args_cli: argparse.Namespace, agent_cfg) -> None:
+    try:
+        import wandb
+    except ImportError:
+        return
+    if wandb.run is None:
+        return
+    run_name = args_cli.wandb_run_name or args_cli.run_name or agent_cfg.run_name
+    if run_name:
+        wandb.run.name = run_name
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -140,10 +223,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
 
+    training_metadata = _build_training_metadata(args_cli, agent_cfg, env_cfg)
+    train_cfg = agent_cfg.to_dict()
+    train_cfg.update(training_metadata)
+    if args_cli.wandb_run_id is not None:
+        train_cfg["wandb_run_id"] = args_cli.wandb_run_id
+    if args_cli.wandb_resume is not None:
+        train_cfg["wandb_resume"] = args_cli.wandb_resume
+
     # create runner from rsl-rl
+    _prepare_wandb_resume_env(args_cli, agent_cfg)
     runner = OnPolicyRunner(
-        env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device, registry_name=registry_name
+        env, train_cfg, log_dir=log_dir, device=agent_cfg.device, registry_name=registry_name
     )
+    if agent_cfg.logger == "wandb":
+        _update_wandb_name_if_active(args_cli, agent_cfg)
+        _update_wandb_config_if_active(training_metadata)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir

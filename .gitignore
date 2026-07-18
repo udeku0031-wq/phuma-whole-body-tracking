@@ -52,6 +52,8 @@ PHUMA_wbt_motions/*
 PHUMA_wbt_motions/manifests/*
 !PHUMA_wbt_motions/manifests/splits_v1/
 !PHUMA_wbt_motions/manifests/splits_v1/**
+!PHUMA_wbt_motions/manifests/experiments/
+!PHUMA_wbt_motions/manifests/experiments/**
 
 # Local editor/cache/temp folders
 .marscode/

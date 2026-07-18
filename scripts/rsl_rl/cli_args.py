@@ -7,6 +7,17 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg
 
 
+def _str_to_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got '{value}'.")
+
+
 def add_rsl_rl_args(parser: argparse.ArgumentParser):
     """Add RSL-RL arguments to the parser.
 
@@ -21,7 +32,14 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
     # -- load arguments
-    arg_group.add_argument("--resume", type=bool, default=None, help="Whether to resume from a checkpoint.")
+    arg_group.add_argument(
+        "--resume",
+        nargs="?",
+        const=True,
+        type=_str_to_bool,
+        default=None,
+        help="Whether to resume from a checkpoint. Accepts bare --resume, --resume True, or --resume False.",
+    )
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
     # -- logger arguments
@@ -33,6 +51,25 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     )
     arg_group.add_argument(
         "--wandb_path", type=str, default=None, help="Name of the logging project when using wandb or neptune."
+    )
+    arg_group.add_argument(
+        "--wandb_run_id",
+        type=str,
+        default=None,
+        help="Stable W&B run id. Reuse the same id with --wandb_resume must to keep resumed curves continuous.",
+    )
+    arg_group.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Display name for the W&B run. Defaults to --run_name when omitted.",
+    )
+    arg_group.add_argument(
+        "--wandb_resume",
+        type=str,
+        default=None,
+        choices={"never", "allow", "must"},
+        help="W&B resume policy. Use 'never' for a fresh run and 'must' when resuming an existing W&B run.",
     )
 
 

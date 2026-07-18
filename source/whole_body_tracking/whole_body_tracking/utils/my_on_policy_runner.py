@@ -60,6 +60,28 @@ def _is_wandb_logger(runner: OnPolicyRunner) -> bool:
     )
 
 
+def _disable_onnx_on_save() -> bool:
+    return os.environ.get("WBT_DISABLE_ONNX_ON_SAVE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _enable_wandb_model_upload() -> bool:
+    return os.environ.get("WBT_ENABLE_WANDB_MODEL_SAVE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _save_checkpoint_without_wandb_upload(runner: OnPolicyRunner, path: str, infos=None) -> None:
+    """Save locally while keeping W&B scalar logging, but skip cloud checkpoint files by default."""
+    if getattr(runner, "logger_type", "").lower() != "wandb" or _enable_wandb_model_upload():
+        OnPolicyRunner.save(runner, path, infos)
+        return
+
+    logger_type = runner.logger_type
+    runner.logger_type = "_wandb_no_model_upload"
+    try:
+        OnPolicyRunner.save(runner, path, infos)
+    finally:
+        runner.logger_type = logger_type
+
+
 def _actor_critic(runner: OnPolicyRunner):
     if hasattr(runner.alg, "policy"):
         return runner.alg.policy
@@ -72,9 +94,14 @@ class MyOnPolicyRunner(OnPolicyRunner):
 
     def save(self, path: str, infos=None):
         """Save the model and training information."""
-        super().save(path, infos)
+        _save_checkpoint_without_wandb_upload(self, path, infos)
         actor_critic = _actor_critic(self)
-        if _is_wandb_logger(self) and actor_critic is not None and hasattr(self, "obs_normalizer"):
+        if (
+            _is_wandb_logger(self)
+            and not _disable_onnx_on_save()
+            and actor_critic is not None
+            and hasattr(self, "obs_normalizer")
+        ):
             policy_path = path.split("model")[0]
             filename = policy_path.split("/")[-2] + ".onnx"
             export_policy_as_onnx(actor_critic, normalizer=self.obs_normalizer, path=policy_path, filename=filename)
@@ -91,12 +118,12 @@ class MotionOnPolicyRunner(OnPolicyRunner):
 
     def save(self, path: str, infos=None):
         """Save the model and training information."""
-        super().save(path, infos)
+        _save_checkpoint_without_wandb_upload(self, path, infos)
         if _is_wandb_logger(self):
             policy_path = path.split("model")[0]
             filename = policy_path.split("/")[-2] + ".onnx"
             actor_critic = _actor_critic(self)
-            if actor_critic is not None and hasattr(self, "obs_normalizer"):
+            if actor_critic is not None and hasattr(self, "obs_normalizer") and not _disable_onnx_on_save():
                 export_motion_policy_as_onnx(
                     self.env.unwrapped,
                     actor_critic,

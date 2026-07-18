@@ -1,0 +1,24 @@
+{
+  "created_at": "2026-07-15T09:58:24.869816+00:00",
+  "git_commit": "56ccb8837dc3caf17690c8fbba4bb6e67ba29a7c",
+  "output_dir": "/home/l/whole_body_tracking_new/PHUMA_wbt_motions/manifests/experiments/random_seed42",
+  "path_mode": "relative",
+  "project_root": "/home/l/whole_body_tracking_new",
+  "requested_sizes": [
+    3000,
+    6000,
+    12000
+  ],
+  "sampling_method": "uniform_random_file_sampling",
+  "sampling_notes": [
+    "No category balancing",
+    "No quality filtering",
+    "No source-group deduplication",
+    "No difficulty weighting"
+  ],
+  "seed": 42,
+  "split_config_checksum": "3b6df2b62505d49d920e0db8ac365bb3fe2e1f892a261396404ab80503701c61",
+  "split_version": "splits_v1",
+  "train_pool_manifest": "/home/l/whole_body_tracking_new/PHUMA_wbt_motions/manifests/splits_v1/train_pool.txt",
+  "train_pool_size": 60858
+}

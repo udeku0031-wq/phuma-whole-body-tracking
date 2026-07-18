@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+import evaluation_utils as eval_utils  # isort: skip
 
 
 parser = argparse.ArgumentParser(description="Evaluate an RSL-RL WBT checkpoint on a fixed motion manifest.")
@@ -25,6 +27,8 @@ parser.add_argument("--max_motions", type=int, default=None, help="Evaluate only
 parser.add_argument("--progress_interval", type=int, default=20, help="Print progress every N completed motions.")
 parser.add_argument("--episode_length_s", type=float, default=60.0, help="Evaluation episode length cap in seconds.")
 parser.add_argument("--deterministic", action="store_true", help="Use deterministic inference policy.")
+parser.add_argument("--confirm_final_test", "--confirm-final-test", action="store_true", help="Allow evaluation on the frozen final test manifest.")
+parser.add_argument("--dry_run", "--dry-run", action="store_true", help="Print evaluation configuration without launching Isaac Sim.")
 parser.add_argument(
     "--disable_randomization",
     "--disable-randomization",
@@ -36,6 +40,26 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+if eval_utils.should_reject_final_test(args_cli.motion_file, args_cli.confirm_final_test):
+    parser.error("Test is reserved for the frozen final checkpoint. Re-run with --confirm_final_test.")
+
+if args_cli.dry_run:
+    print("[DRY-RUN] evaluate.py configuration")
+    print(f"  task: {args_cli.task}")
+    print(f"  motion_file: {args_cli.motion_file}")
+    print(f"  output_dir: {args_cli.output_dir}")
+    print(f"  load_run: {args_cli.load_run}")
+    print(f"  checkpoint: {args_cli.checkpoint}")
+    print(f"  num_envs: {args_cli.num_envs}")
+    print(f"  seed: {args_cli.seed}")
+    print(f"  deterministic: {args_cli.deterministic}")
+    print(f"  disable_randomization: {args_cli.disable_randomization}")
+    print(f"  resume: {args_cli.resume}")
+    sys.exit(0)
+
+if hasattr(args_cli, "headless"):
+    args_cli.headless = True
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -152,7 +176,8 @@ def _motion_info(path: Path, project_root: Path, metadata_lookup: dict[str, dict
     return _infer_category(path), _infer_source_group(path)
 
 
-def _disable_eval_randomization(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg) -> None:
+def _disable_eval_randomization(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg) -> list[str]:
+    warnings: list[str] = []
     motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
     if motion_cfg is not None:
         zero_pose_keys = ("x", "y", "z", "roll", "pitch", "yaw")
@@ -160,6 +185,8 @@ def _disable_eval_randomization(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg |
         motion_cfg.velocity_range = {key: (0.0, 0.0) for key in zero_pose_keys}
         motion_cfg.joint_position_range = (0.0, 0.0)
         motion_cfg.debug_vis = False
+    else:
+        warnings.append("env_cfg.commands.motion was not found; motion reset randomization could not be disabled.")
 
     observations_cfg = getattr(env_cfg, "observations", None)
     if observations_cfg is not None:
@@ -172,12 +199,18 @@ def _disable_eval_randomization(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg |
             for term_cfg in getattr(group_cfg, "__dict__", {}).values():
                 if hasattr(term_cfg, "noise"):
                     term_cfg.noise = None
+    else:
+        warnings.append("env_cfg.observations was not found; observation corruption could not be checked.")
 
     events_cfg = getattr(env_cfg, "events", None)
     if events_cfg is not None:
         for name in ("physics_material", "add_joint_default_pos", "base_com", "push_robot"):
             if hasattr(events_cfg, name):
                 setattr(events_cfg, name, None)
+    else:
+        warnings.append("env_cfg.events was not found; domain randomization events could not be checked.")
+
+    return warnings
 
 
 def _termination_reason(env, env_idx: int) -> str:
@@ -267,8 +300,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.device = args_cli.device
     if hasattr(env_cfg, "seed"):
         env_cfg.seed = args_cli.seed
+    randomization_warnings: list[str] = []
     if args_cli.disable_randomization:
-        _disable_eval_randomization(env_cfg)
+        randomization_warnings = _disable_eval_randomization(env_cfg)
 
     random.seed(args_cli.seed)
     np.random.seed(args_cli.seed)
@@ -280,6 +314,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+    checkpoint_name = Path(resume_path).name
 
     if args_cli.registry_name is not None:
         import wandb
@@ -301,12 +336,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)
+    actor_critic = getattr(ppo_runner.alg, "policy", getattr(ppo_runner.alg, "actor_critic", None))
+    if actor_critic is not None and hasattr(actor_critic, "eval"):
+        actor_critic.eval()
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     base_env = env.unwrapped
     command = base_env.command_manager.get_term("motion")
-    project_root = _project_root()
-    metadata_lookup = _load_metadata_lookup(project_root)
+    if not hasattr(command, "set_eval_motion_state"):
+        raise RuntimeError("MotionCommand.set_eval_motion_state is required for deterministic evaluation.")
+
+    project_root = Path.cwd().resolve()
+    metadata_lookup = eval_utils.load_metadata_lookup(project_root)
     output_dir = Path(args_cli.output_dir)
     if not output_dir.is_absolute():
         output_dir = project_root / output_dir
@@ -319,29 +360,71 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         motion_paths = motion_paths[:total_motions]
         motion_lengths = motion_lengths[:total_motions]
 
-    print(f"[INFO]: Evaluating {total_motions} motion(s) with {env.num_envs} env(s).")
-    print("[INFO]: Each motion starts from frame 0 and is evaluated once.")
-
+    expected_motion_paths = [eval_utils.project_relative(path, project_root) for path in motion_paths]
+    expected_set = set(expected_motion_paths)
     results: list[dict[str, object]] = []
-    extra_summary = {
+    if args_cli.resume:
+        results = eval_utils.load_per_motion_csv(output_dir / "per_motion.csv")
+        observed = [str(row.get("motion_path", "")) for row in results]
+        duplicates = sorted(path for path, count in Counter(observed).items() if count > 1)
+        unexpected = sorted(set(observed).difference(expected_set))
+        if duplicates:
+            raise RuntimeError(f"Existing per_motion.csv contains duplicate motion rows: {duplicates[:5]}")
+        if unexpected:
+            raise RuntimeError(f"Existing per_motion.csv contains motions outside this manifest: {unexpected[:5]}")
+
+    completed_paths = {str(row.get("motion_path", "")) for row in results}
+    pending_indices = [index for index, path in enumerate(expected_motion_paths) if path not in completed_paths]
+
+    print(f"[INFO]: Evaluating {total_motions} motion(s) with {env.num_envs} env(s).")
+    if args_cli.resume and results:
+        print(f"[INFO]: Resuming from {output_dir / 'per_motion.csv'}; skipping {len(results)} completed motion(s).")
+    print("[INFO]: Each motion starts from frame 0 and is evaluated once.")
+    if args_cli.disable_randomization and randomization_warnings:
+        for warning in randomization_warnings:
+            print(f"[WARN]: {warning}", flush=True)
+
+    manifest_path = Path(args_cli.motion_file).resolve() if args_cli.motion_file is not None else None
+    evaluation_config = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "motion_file": args_cli.motion_file,
+        "task": args_cli.task,
+        "manifest": args_cli.motion_file,
+        "manifest_sha256": eval_utils.sha256_file(args_cli.motion_file) if args_cli.motion_file and Path(args_cli.motion_file).exists() else "",
         "load_run": agent_cfg.load_run,
-        "checkpoint": agent_cfg.load_checkpoint,
+        "checkpoint": checkpoint_name,
+        "checkpoint_path": str(Path(resume_path).resolve()),
+        "checkpoint_sha256": eval_utils.sha256_file(resume_path),
+        "git_commit": eval_utils.git_commit(project_root),
         "seed": args_cli.seed,
         "num_envs": env.num_envs,
         "episode_length_s": args_cli.episode_length_s,
         "deterministic": bool(args_cli.deterministic),
         "disable_randomization": bool(args_cli.disable_randomization),
+        "randomization_warnings": randomization_warnings,
+        "confirm_final_test": bool(args_cli.confirm_final_test),
+        "max_motions": args_cli.max_motions,
+        "joint_count": int(command.joint_pos.shape[1]),
+        "metric_definitions": {
+            "success": "1 only when the evaluator reaches the final motion frame before early termination.",
+            "completion_ratio": "completed_frames / num_frames, clamped to [0, 1].",
+            "body_position_error_m": (
+                "Mean over evaluation steps of MotionCommand.metrics['error_body_pos']; "
+                "that metric is the mean Euclidean distance over configured tracked bodies after yaw/root alignment "
+                "in MotionCommand._update_relative_body_targets."
+            ),
+            "joint_position_error_l2_rad": "Mean over evaluation steps of the L2 norm over all robot joints.",
+            "joint_position_error_rms_rad": "joint_position_error_l2_rad / sqrt(joint_count).",
+        },
     }
+    if manifest_path is not None:
+        evaluation_config["manifest_path"] = str(manifest_path)
 
     completed_since_print = 0
-    for batch_start in range(0, total_motions, env.num_envs):
+    for batch_start in range(0, len(pending_indices), env.num_envs):
         if not simulation_app.is_running():
             break
 
-        batch_end = min(batch_start + env.num_envs, total_motions)
-        batch_motion_ids = list(range(batch_start, batch_end))
+        batch_motion_ids = pending_indices[batch_start : batch_start + env.num_envs]
         batch_size = len(batch_motion_ids)
         env_ids = torch.arange(batch_size, dtype=torch.long, device=base_env.device)
         motion_ids = torch.tensor(batch_motion_ids, dtype=torch.long, device=base_env.device)
@@ -382,9 +465,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
                 success = reached_motion_end
                 reason = "completed" if success else _termination_reason(base_env, env_idx)
-                category, source_group = _motion_info(motion_paths[motion_index], project_root, metadata_lookup)
+                category, source_group = eval_utils.motion_info(motion_paths[motion_index], project_root, metadata_lookup)
                 results.append(
-                    _make_result_row(
+                    eval_utils.make_result_row(
                         motion_path=motion_paths[motion_index],
                         category=category,
                         source_group=source_group,
@@ -395,18 +478,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         metric_count=int(metric_counts[env_idx].item()),
                         success=success,
                         termination_reason=reason,
+                        checkpoint=checkpoint_name,
                         project_root=project_root,
+                        joint_count=int(command.joint_pos.shape[1]),
                     )
                 )
                 active[env_idx] = False
                 completed_since_print += 1
+                eval_utils.write_evaluation_outputs(
+                    output_dir,
+                    results,
+                    checkpoint=checkpoint_name,
+                    evaluation_config=evaluation_config,
+                    expected_motion_paths=expected_motion_paths,
+                )
 
         if bool(torch.any(active).item()):
             for env_idx in torch.nonzero(active, as_tuple=False).flatten().detach().cpu().tolist():
                 motion_index = batch_motion_ids[env_idx]
-                category, source_group = _motion_info(motion_paths[motion_index], project_root, metadata_lookup)
+                category, source_group = eval_utils.motion_info(motion_paths[motion_index], project_root, metadata_lookup)
                 results.append(
-                    _make_result_row(
+                    eval_utils.make_result_row(
                         motion_path=motion_paths[motion_index],
                         category=category,
                         source_group=source_group,
@@ -417,34 +509,53 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         metric_count=int(metric_counts[env_idx].item()),
                         success=False,
                         termination_reason="interrupted",
+                        checkpoint=checkpoint_name,
                         project_root=project_root,
+                        joint_count=int(command.joint_pos.shape[1]),
                     )
                 )
 
-        _write_outputs(output_dir, results, extra_summary)
+        eval_utils.write_evaluation_outputs(
+            output_dir,
+            results,
+            checkpoint=checkpoint_name,
+            evaluation_config=evaluation_config,
+            expected_motion_paths=expected_motion_paths,
+        )
         if args_cli.progress_interval > 0 and completed_since_print >= args_cli.progress_interval:
-            summary = _summary(results)
+            summary = eval_utils.summarize_rows(results, checkpoint=checkpoint_name)
             print(
                 f"[INFO]: Evaluated {len(results)}/{total_motions} motions, "
-                f"success_rate={summary['success_rate']:.3f}, "
-                f"completion={summary['completion_ratio']:.3f}",
+                f"success_rate={summary['micro_success_rate']:.3f}, "
+                f"completion={summary['mean_completion_ratio']:.3f}",
                 flush=True,
             )
             completed_since_print = 0
 
-    _write_outputs(output_dir, results, extra_summary)
-    summary = _summary(results)
+    summary = eval_utils.write_evaluation_outputs(
+        output_dir,
+        results,
+        checkpoint=checkpoint_name,
+        evaluation_config=evaluation_config,
+        expected_motion_paths=expected_motion_paths,
+    )
     print("[INFO]: Evaluation complete.")
     print(f"[INFO]: per_motion.csv: {output_dir / 'per_motion.csv'}")
     print(f"[INFO]: summary.json: {output_dir / 'summary.json'}")
     print(
-        f"[INFO]: success_rate={summary['success_rate']:.4f}, "
-        f"completion_ratio={summary['completion_ratio']:.4f}, "
-        f"body_pos_error_m={summary['body_position_error']:.4f}, "
-        f"joint_pos_error_rad={summary['joint_position_error']:.4f}"
+        f"[INFO]: success_rate={summary['micro_success_rate']:.4f}, "
+        f"macro_success_rate={summary['macro_success_rate']:.4f}, "
+        f"completion_ratio={summary['mean_completion_ratio']:.4f}, "
+        f"body_position_error_m={summary['mean_body_position_error_m']:.4f}, "
+        f"joint_position_error_l2_rad={summary['mean_joint_position_error_l2_rad']:.4f}, "
+        f"joint_position_error_rms_rad={summary['mean_joint_position_error_rms_rad']:.4f}"
     )
 
     env.close()
+    integrity = summary.get("manifest_integrity", {})
+    if integrity and not integrity.get("ok", False):
+        print(f"[ERROR]: Manifest integrity check failed: {json.dumps(integrity, indent=2)}", flush=True)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
