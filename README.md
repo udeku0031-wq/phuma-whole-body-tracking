@@ -23,6 +23,121 @@ train any sim-to-real-ready motion in the LAFAN1 dataset, without tuning any par
 For sim-to-sim and sim-to-real deployment, please refer to
 the [motion_tracking_controller](https://github.com/HybridRobotics/motion_tracking_controller).
 
+## Repository Workflow
+
+This project uses GitHub as the primary repository and Gitee as a backup mirror.
+Large local artifacts such as datasets, converted `.npz` files, model
+checkpoints, W&B logs, and evaluation results must not be committed.
+
+```text
+origin   git@github.com:udeku0031-wq/phuma-whole-body-tracking.git
+gitee    https://gitee.com/zuiyoujie6878/whole_body_tracking_phuma.git
+upstream https://github.com/HybridRobotics/whole_body_tracking.git
+```
+
+Before every commit or push, check that generated data is not staged:
+
+```bash
+git status
+git diff --cached --name-only | grep -E '^(PHUMA/|PHUMA_wbt_motions/g1|logs/|wandb/|results/)|(\.npz$|\.pt$|\.onnx$|\.wandb$|\.zip$)' || true
+```
+
+If the second command prints nothing, the staged files do not include the
+known large artifacts.
+
+### Sync Main
+
+Pull the latest main branch from GitHub:
+
+```bash
+git switch main
+git pull origin main
+```
+
+Push committed changes to GitHub:
+
+```bash
+git push origin main
+```
+
+Mirror the same main branch to Gitee when a milestone or useful checkpoint of
+the codebase is reached:
+
+```bash
+git push gitee main
+git push gitee --tags
+```
+
+### Create An Experiment Branch
+
+Create a branch from the current GitHub main branch:
+
+```bash
+git switch main
+git pull origin main
+git switch -c exp/<experiment-name>
+```
+
+Use short ASCII branch names. Examples:
+
+```text
+exp/direct-mixed-training
+exp/abt-random6000-v1
+exp/validation-tools
+```
+
+Commit and push the branch to GitHub:
+
+```bash
+git add <CODE_OR_MANIFEST_FILES>
+git commit -m "<short experiment change summary>"
+git push -u origin exp/<experiment-name>
+```
+
+Optional Gitee backup for the same branch:
+
+```bash
+git push -u gitee exp/<experiment-name>
+```
+
+### Merge An Experiment Branch Into Main
+
+After the experiment code is stable and results are documented:
+
+```bash
+git switch main
+git pull origin main
+git merge exp/<experiment-name>
+git push origin main
+```
+
+If this branch defines a frozen baseline or important reproducible state, create
+an annotated tag and push it to GitHub:
+
+```bash
+git tag -a baseline-direct-random6000-v1 \
+  -m "Frozen Direct Mixed Training baseline: random6000 seed42, model_33999"
+git push origin baseline-direct-random6000-v1
+```
+
+Then mirror the main branch and tags to Gitee:
+
+```bash
+git push gitee main
+git push gitee --tags
+```
+
+### Track Upstream Changes
+
+The official `HybridRobotics/whole_body_tracking` repository is kept as
+`upstream`. Fetch it only when intentionally comparing or porting upstream
+changes:
+
+```bash
+git fetch upstream
+git log --oneline --decorate --graph --all --max-count=20
+```
+
 ### Alternative Implementations
 
 - There is an alternative reproduction of BeyondMimic in [mjlab](https://github.com/mujocolab/mjlab), a new Isaac Lab-style manager API powered by MuJoCo-Warp for RL and robotics research. See the implementation [here](https://github.com/mujocolab/mjlab/blob/main/src/mjlab/tasks/tracking/tracking_env_cfg.py).
