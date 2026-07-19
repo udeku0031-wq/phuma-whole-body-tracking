@@ -97,6 +97,25 @@ def _read_sampling_config(motion_file: str) -> dict:
         return {}
 
 
+def _build_research_metadata(env_cfg) -> dict:
+    """Flatten the low-cardinality research config for runner and W&B metadata."""
+
+    research = env_cfg.commands.motion.research
+    return {
+        "method_name": research.method_name,
+        "segment_enabled": research.segment.enabled,
+        "segment_length_seconds": research.segment.length_seconds,
+        "quality_gate_enabled": research.quality_gate.enabled,
+        "difficulty_calibration_enabled": research.difficulty_calibration.enabled,
+        "motion_sampling_mode": research.motion_sampling.mode,
+        "segment_sampling_mode": research.segment_sampling.mode,
+        "diversity_constraint_enabled": research.diversity_constraint.enabled,
+        "sampling_statistics_enabled": research.sampling_statistics.enabled,
+        "sampling_statistics_log_interval": research.sampling_statistics.log_interval,
+        "probability_validation_epsilon": research.probability_validation.epsilon,
+    }
+
+
 def _build_training_metadata(args_cli: argparse.Namespace, agent_cfg, env_cfg) -> dict:
     motion_file = os.path.abspath(args_cli.motion_file) if args_cli.motion_file is not None else None
     sampling_config = _read_sampling_config(motion_file) if motion_file is not None else {}
@@ -113,6 +132,7 @@ def _build_training_metadata(args_cli: argparse.Namespace, agent_cfg, env_cfg) -
         "resume": bool(agent_cfg.resume),
         "curriculum": False,
     }
+    metadata.update(_build_research_metadata(env_cfg))
     if sampling_config.get("sampling_method") == "uniform_random_file_sampling":
         metadata.update(
             {
@@ -126,15 +146,6 @@ def _build_training_metadata(args_cli: argparse.Namespace, agent_cfg, env_cfg) -
     return {key: value for key, value in metadata.items() if value is not None}
 
 
-def _update_wandb_config_if_active(metadata: dict) -> None:
-    try:
-        import wandb
-    except ImportError:
-        return
-    if wandb.run is not None:
-        wandb.config.update(metadata, allow_val_change=True)
-
-
 def _prepare_wandb_resume_env(args_cli: argparse.Namespace, agent_cfg) -> None:
     """Expose stable W&B run identity to rsl_rl's WandbSummaryWriter."""
     if agent_cfg.logger != "wandb":
@@ -146,18 +157,6 @@ def _prepare_wandb_resume_env(args_cli: argparse.Namespace, agent_cfg) -> None:
     run_name = args_cli.wandb_run_name or args_cli.run_name or agent_cfg.run_name
     if run_name:
         os.environ["WANDB_NAME"] = run_name
-
-
-def _update_wandb_name_if_active(args_cli: argparse.Namespace, agent_cfg) -> None:
-    try:
-        import wandb
-    except ImportError:
-        return
-    if wandb.run is None:
-        return
-    run_name = args_cli.wandb_run_name or args_cli.run_name or agent_cfg.run_name
-    if run_name:
-        wandb.run.name = run_name
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -226,6 +225,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     training_metadata = _build_training_metadata(args_cli, agent_cfg, env_cfg)
     train_cfg = agent_cfg.to_dict()
     train_cfg.update(training_metadata)
+    train_cfg["wandb_metadata"] = training_metadata
+    if args_cli.wandb_run_name is not None:
+        train_cfg["wandb_run_name"] = args_cli.wandb_run_name
     if args_cli.wandb_run_id is not None:
         train_cfg["wandb_run_id"] = args_cli.wandb_run_id
     if args_cli.wandb_resume is not None:
@@ -236,9 +238,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = OnPolicyRunner(
         env, train_cfg, log_dir=log_dir, device=agent_cfg.device, registry_name=registry_name
     )
-    if agent_cfg.logger == "wandb":
-        _update_wandb_name_if_active(args_cli, agent_cfg)
-        _update_wandb_config_if_active(training_metadata)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
@@ -256,10 +255,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
-
-    # close the simulator
-    env.close()
+    try:
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    finally:
+        writer = getattr(runner, "writer", None)
+        try:
+            if writer is not None:
+                if hasattr(writer, "flush"):
+                    writer.flush()
+                if hasattr(writer, "stop"):
+                    writer.stop()
+                if hasattr(writer, "close"):
+                    writer.close()
+        finally:
+            # close the simulator
+            env.close()
 
 
 if __name__ == "__main__":

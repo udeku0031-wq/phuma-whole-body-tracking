@@ -255,14 +255,25 @@ Use the same string for `--run_name`, `--wandb_run_name`, and
 `--wandb_run_id` unless there is a clear reason not to. Do not use spaces or
 Chinese characters in `--wandb_run_id`.
 
+Before starting W&B training in a new terminal, export the PHUMA W&B account
+variables:
+
+```bash
+export WANDB_USERNAME=longxianli222-northeastern-university
+export WANDB_ENTITY=longxianli222-northeastern-university
+```
+
 Fresh training:
 
 ```bash
 cd ~/whole_body_tracking_new
 conda activate hybrid_robot
+export WANDB_USERNAME=longxianli222-northeastern-university
+export WANDB_ENTITY=longxianli222-northeastern-university
 
 env -u PYTHONPATH -u LD_LIBRARY_PATH \
   WANDB_USERNAME=longxianli222-northeastern-university \
+  WANDB_ENTITY=longxianli222-northeastern-university \
   WBT_DISABLE_ONNX_ON_SAVE=1 \
 python scripts/rsl_rl/train.py \
   --task Tracking-Flat-G1-v0 \
@@ -284,8 +295,12 @@ run id. Use `--wandb_resume must` so W&B refuses to create a new curve if the
 run id is wrong:
 
 ```bash
+export WANDB_USERNAME=longxianli222-northeastern-university
+export WANDB_ENTITY=longxianli222-northeastern-university
+
 env -u PYTHONPATH -u LD_LIBRARY_PATH \
   WANDB_USERNAME=longxianli222-northeastern-university \
+  WANDB_ENTITY=longxianli222-northeastern-university \
   WBT_DISABLE_ONNX_ON_SAVE=1 \
 python scripts/rsl_rl/train.py \
   --task Tracking-Flat-G1-v0 \

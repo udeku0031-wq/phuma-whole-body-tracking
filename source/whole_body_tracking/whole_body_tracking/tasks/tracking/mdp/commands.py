@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import math
-import numpy as np
 import os
-import torch
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
@@ -23,6 +24,13 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from whole_body_tracking.utils.sampling import (
+    SAMPLING_STATE_VERSION,
+    FixedLengthSegmentIndex,
+    SamplingStatistics,
+    motion_pool_fingerprint,
+)
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -35,6 +43,7 @@ class MotionLoader:
         loaded = [self._load_npz(path) for path in self.motion_files]
 
         self.fps = loaded[0]["fps"]
+        motion_fps = [float(item["fps"]) for item in loaded]
         reference_joint_dim = loaded[0]["joint_pos"].shape[1]
         reference_body_count = loaded[0]["body_pos_w"].shape[1]
         for item in loaded[1:]:
@@ -73,12 +82,18 @@ class MotionLoader:
             [torch.tensor(item["body_ang_vel_w"], dtype=torch.float32, device=device) for item in loaded], dim=0
         )
         self.motion_lengths = torch.tensor([item["length"] for item in loaded], dtype=torch.long, device=device)
+        self.motion_fps = torch.tensor(motion_fps, dtype=torch.float64, device=device)
         self.motion_offsets = torch.zeros_like(self.motion_lengths)
         if len(self.motion_lengths) > 1:
             self.motion_offsets[1:] = torch.cumsum(self.motion_lengths[:-1], dim=0)
         self.num_motions = len(self.motion_files)
         self.total_frames = int(self.motion_lengths.sum().item())
         self.time_step_total = int(self.motion_lengths.max().item())
+        self.pool_fingerprint = motion_pool_fingerprint(
+            self.motion_files,
+            [int(item["length"]) for item in loaded],
+            motion_fps,
+        )
 
         self._validate_shapes()
 
@@ -236,11 +251,43 @@ class MotionLoader:
         return self._body_ang_vel_w[:, self._body_indexes]
 
 
+def _validate_stage0_research_config(cfg: ResearchExperimentCfg) -> None:
+    """Fail fast when a configuration requests algorithms not implemented in stage 0."""
+
+    if cfg.method_name != "M0":
+        raise NotImplementedError(
+            f"Research method '{cfg.method_name}' is not implemented in stage 0; only method_name='M0' is available."
+        )
+    if cfg.quality_gate.enabled:
+        raise NotImplementedError("quality_gate.enabled=True is not implemented in stage 0.")
+    if cfg.difficulty_calibration.enabled:
+        raise NotImplementedError("difficulty_calibration.enabled=True is not implemented in stage 0.")
+    if cfg.diversity_constraint.enabled:
+        raise NotImplementedError("diversity_constraint.enabled=True is not implemented in stage 0.")
+    if cfg.motion_sampling.mode != "uniform":
+        raise NotImplementedError(
+            f"motion_sampling mode '{cfg.motion_sampling.mode}' is not implemented in stage 0; use 'uniform'."
+        )
+    if cfg.segment_sampling.mode != "uniform":
+        raise NotImplementedError(
+            f"segment_sampling mode '{cfg.segment_sampling.mode}' is not implemented in stage 0; use 'uniform'."
+        )
+    if not math.isfinite(cfg.segment.length_seconds) or cfg.segment.length_seconds <= 0.0:
+        raise ValueError("segment.length_seconds must be finite and greater than zero.")
+    if cfg.sampling_statistics.enabled and not cfg.segment.enabled:
+        raise ValueError("sampling_statistics requires segment.enabled=True in stage 0.")
+    if cfg.sampling_statistics.log_interval < 1:
+        raise ValueError("sampling_statistics.log_interval must be at least 1.")
+    if not math.isfinite(cfg.probability_validation.epsilon) or cfg.probability_validation.epsilon <= 0.0:
+        raise ValueError("probability_validation.epsilon must be finite and greater than zero.")
+
+
 class MotionCommand(CommandTerm):
     cfg: MotionCommandCfg
 
     def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
+        _validate_stage0_research_config(cfg.research)
 
         self.robot: Articulation = env.scene[cfg.asset_name]
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body_name)
@@ -262,8 +309,27 @@ class MotionCommand(CommandTerm):
             f"[INFO]: Loaded {self.motion.num_motions} motion(s), "
             f"{self.motion.total_frames} total frames, fps={self.motion.fps:g}"
         )
+        self.segment_index: FixedLengthSegmentIndex | None = None
+        self.sampling_statistics: SamplingStatistics | None = None
+        if self.cfg.research.segment.enabled:
+            self.segment_index = FixedLengthSegmentIndex(
+                self.motion.motion_lengths,
+                self.motion.motion_fps,
+                self.cfg.research.segment.length_seconds,
+                device=self.device,
+            )
+            if self.cfg.research.sampling_statistics.enabled:
+                self.sampling_statistics = SamplingStatistics(
+                    self.segment_index, pool_fingerprint=self.motion.pool_fingerprint
+                )
+            print(
+                f"[INFO]: Built {self.segment_index.num_segments} fixed-length segment(s), "
+                f"duration={self.segment_index.segment_length_seconds:g}s"
+            )
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.assigned_local_segment_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.assigned_global_segment_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
@@ -295,6 +361,20 @@ class MotionCommand(CommandTerm):
     @property
     def frame_indices(self) -> torch.Tensor:
         return self.motion.frame_indices(self.motion_ids, self.time_steps)
+
+    @property
+    def current_local_segment_ids(self) -> torch.Tensor | None:
+        if self.segment_index is None:
+            return None
+        local_ids, _ = self.segment_index.motion_frame_to_segment(self.motion_ids, self.time_steps)
+        return local_ids
+
+    @property
+    def current_global_segment_ids(self) -> torch.Tensor | None:
+        if self.segment_index is None:
+            return None
+        _, global_ids = self.segment_index.motion_frame_to_segment(self.motion_ids, self.time_steps)
+        return global_ids
 
     @property
     def joint_pos(self) -> torch.Tensor:
@@ -535,10 +615,37 @@ class MotionCommand(CommandTerm):
         self._update_relative_body_targets()
         self._update_metrics()
 
+    def _record_sampling_assignments(self, env_ids: Sequence[int]) -> None:
+        """Observe legacy sampler output without consuming random numbers."""
+
+        if self.segment_index is None or len(env_ids) == 0:
+            return
+        motion_ids = self.motion_ids[env_ids]
+        start_frames = self.time_steps[env_ids]
+        if self.sampling_statistics is None:
+            local_ids, global_ids = self.segment_index.motion_frame_to_segment(motion_ids, start_frames)
+        else:
+            local_ids, global_ids = self.sampling_statistics.record_assignments(motion_ids, start_frames)
+        self.assigned_local_segment_ids[env_ids] = local_ids
+        self.assigned_global_segment_ids[env_ids] = global_ids
+
+    def _sample_motion_and_start_frame(self, env_ids: Sequence[int]) -> None:
+        """Dispatch sampling modes while preserving the legacy uniform RNG path."""
+
+        motion_mode = self.cfg.research.motion_sampling.mode
+        segment_mode = self.cfg.research.segment_sampling.mode
+        if motion_mode == "uniform" and segment_mode == "uniform":
+            self._adaptive_sampling(env_ids)
+            return
+        raise NotImplementedError(
+            f"Sampling modes motion='{motion_mode}', segment='{segment_mode}' are not implemented in stage 0."
+        )
+
     def _resample_command(self, env_ids: Sequence[int]):
         if len(env_ids) == 0:
             return
-        self._adaptive_sampling(env_ids)
+        self._sample_motion_and_start_frame(env_ids)
+        self._record_sampling_assignments(env_ids)
         self._write_current_motion_state_to_sim(env_ids, randomize=True)
 
     def _update_command(self):
@@ -551,6 +658,102 @@ class MotionCommand(CommandTerm):
             self.cfg.adaptive_alpha * self._current_bin_failed + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count
         )
         self._current_bin_failed.zero_()
+
+    def research_config_dict(self) -> dict[str, object]:
+        """Return low-cardinality research configuration for logs and checkpoints."""
+
+        return {
+            "method_name": self.cfg.research.method_name,
+            "segment": {
+                "enabled": self.cfg.research.segment.enabled,
+                "length_seconds": self.cfg.research.segment.length_seconds,
+            },
+            "quality_gate": {"enabled": self.cfg.research.quality_gate.enabled},
+            "difficulty_calibration": {"enabled": self.cfg.research.difficulty_calibration.enabled},
+            "motion_sampling": {"mode": self.cfg.research.motion_sampling.mode},
+            "segment_sampling": {"mode": self.cfg.research.segment_sampling.mode},
+            "diversity_constraint": {"enabled": self.cfg.research.diversity_constraint.enabled},
+            "sampling_statistics": {
+                "enabled": self.cfg.research.sampling_statistics.enabled,
+                "log_interval": self.cfg.research.sampling_statistics.log_interval,
+            },
+            "probability_validation": {"epsilon": self.cfg.research.probability_validation.epsilon},
+        }
+
+    def sampling_metrics(self) -> dict[str, float | int] | None:
+        if self.sampling_statistics is None:
+            return None
+        return self.sampling_statistics.summary()
+
+    def sampling_state_dict(self) -> dict[str, object]:
+        """Return segment layout and assignment counters for a training checkpoint."""
+
+        return {
+            "version": SAMPLING_STATE_VERSION,
+            "research_config": self.research_config_dict(),
+            "segment_index": self.segment_index.state_dict() if self.segment_index is not None else None,
+            "statistics": self.sampling_statistics.state_dict() if self.sampling_statistics is not None else None,
+        }
+
+    def load_sampling_state_dict(self, state: Mapping[str, object]) -> None:
+        """Restore stage-0 statistics after validating the current motion pool."""
+
+        if int(state.get("version", -1)) != SAMPLING_STATE_VERSION:
+            raise ValueError(
+                f"Unsupported MotionCommand sampling state version {state.get('version')}; "
+                f"expected {SAMPLING_STATE_VERSION}."
+            )
+        saved_config = state.get("research_config")
+        if not isinstance(saved_config, Mapping):
+            raise ValueError("Checkpoint research_config is missing or invalid.")
+        current_config = self.research_config_dict()
+        semantic_keys = (
+            "method_name",
+            "segment",
+            "quality_gate",
+            "difficulty_calibration",
+            "motion_sampling",
+            "segment_sampling",
+            "diversity_constraint",
+            "probability_validation",
+        )
+        for key in semantic_keys:
+            if saved_config.get(key) != current_config[key]:
+                raise ValueError(f"Checkpoint research config field '{key}' does not match the current configuration.")
+        saved_statistics_config = saved_config.get("sampling_statistics")
+        current_statistics_config = current_config["sampling_statistics"]
+        if not isinstance(current_statistics_config, Mapping):
+            raise RuntimeError("Current sampling_statistics configuration is invalid.")
+        if not isinstance(saved_statistics_config, Mapping) or (
+            saved_statistics_config.get("enabled") != current_statistics_config.get("enabled")
+        ):
+            raise ValueError("Checkpoint sampling_statistics.enabled does not match the current configuration.")
+
+        saved_index = state.get("segment_index")
+        if (saved_index is None) != (self.segment_index is None):
+            raise ValueError("Checkpoint segment.enabled setting does not match the current configuration.")
+        if self.segment_index is not None:
+            if not isinstance(saved_index, dict):
+                raise ValueError("Checkpoint segment index state is invalid.")
+            self.segment_index.load_state_dict(saved_index)
+
+        saved_statistics = state.get("statistics")
+        if (saved_statistics is None) != (self.sampling_statistics is None):
+            raise ValueError("Checkpoint sampling_statistics.enabled setting does not match the current configuration.")
+        if self.sampling_statistics is not None:
+            if not isinstance(saved_statistics, dict):
+                raise ValueError("Checkpoint sampling statistics state is invalid.")
+            self.sampling_statistics.load_state_dict(saved_statistics)
+
+    def reset_sampling_statistics(self) -> None:
+        if self.sampling_statistics is not None:
+            self.sampling_statistics.reset_statistics()
+
+    def record_current_sampling_assignments(self) -> None:
+        """Count the active assignments created while a resume environment was initialized."""
+
+        env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+        self._record_sampling_assignments(env_ids)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
@@ -603,6 +806,58 @@ class MotionCommand(CommandTerm):
 
 
 @configclass
+class SegmentInfrastructureCfg:
+    """Fixed-duration segment indexing settings."""
+
+    enabled: bool = True
+    length_seconds: float = 1.0
+
+
+@configclass
+class ResearchFeatureToggleCfg:
+    """Common switch for research algorithms introduced after stage 0."""
+
+    enabled: bool = False
+
+
+@configclass
+class SamplingModeCfg:
+    """Sampling mode selection; stage 0 implements only the legacy path."""
+
+    mode: str = "uniform"
+
+
+@configclass
+class SamplingStatisticsCfg:
+    """Shared assignment statistics and runner logging settings."""
+
+    enabled: bool = True
+    log_interval: int = 100
+
+
+@configclass
+class ProbabilityValidationCfg:
+    """Numerical tolerance for future adaptive sampling probabilities."""
+
+    epsilon: float = 1.0e-8
+
+
+@configclass
+class ResearchExperimentCfg:
+    """Unified M0--M7 research configuration."""
+
+    method_name: str = "M0"
+    segment: SegmentInfrastructureCfg = SegmentInfrastructureCfg()
+    quality_gate: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
+    difficulty_calibration: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
+    motion_sampling: SamplingModeCfg = SamplingModeCfg()
+    segment_sampling: SamplingModeCfg = SamplingModeCfg()
+    diversity_constraint: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
+    sampling_statistics: SamplingStatisticsCfg = SamplingStatisticsCfg()
+    probability_validation: ProbabilityValidationCfg = ProbabilityValidationCfg()
+
+
+@configclass
 class MotionCommandCfg(CommandTermCfg):
     """Configuration for the motion command."""
 
@@ -623,6 +878,8 @@ class MotionCommandCfg(CommandTermCfg):
     adaptive_lambda: float = 0.8
     adaptive_uniform_ratio: float = 0.1
     adaptive_alpha: float = 0.001
+
+    research: ResearchExperimentCfg = ResearchExperimentCfg()
 
     anchor_visualizer_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/Command/pose")
     anchor_visualizer_cfg.markers["frame"].scale = (0.2, 0.2, 0.2)

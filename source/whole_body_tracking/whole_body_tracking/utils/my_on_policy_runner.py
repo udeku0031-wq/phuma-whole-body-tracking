@@ -1,4 +1,6 @@
 import os
+import warnings
+from collections.abc import Mapping
 from copy import deepcopy
 from importlib.util import find_spec
 
@@ -9,6 +11,9 @@ from isaaclab_rl.rsl_rl import export_policy_as_onnx
 
 import wandb
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+
+
+SAMPLING_STATE_INFO_KEY = "sampling_state"
 
 
 def _adapt_rsl_rl_cfg(train_cfg: dict) -> dict:
@@ -88,6 +93,115 @@ def _actor_critic(runner: OnPolicyRunner):
     return getattr(runner.alg, "actor_critic", None)
 
 
+def _motion_command(runner: OnPolicyRunner):
+    """Return the motion command without coupling the runner to its concrete class."""
+
+    base_env = getattr(runner.env, "unwrapped", None)
+    command_manager = getattr(base_env, "command_manager", None)
+    if command_manager is None or "motion" not in getattr(command_manager, "active_terms", ()):
+        return None
+    command = command_manager.get_term("motion")
+    if not hasattr(command, "sampling_state_dict"):
+        return None
+    return command
+
+
+def _checkpoint_infos_with_sampling_state(runner: OnPolicyRunner, infos):
+    command = _motion_command(runner)
+    if command is None:
+        return infos
+    if infos is None:
+        checkpoint_infos = {}
+    elif isinstance(infos, Mapping):
+        checkpoint_infos = dict(infos)
+    else:
+        raise TypeError("Checkpoint infos must be a mapping when sampling state persistence is enabled.")
+    checkpoint_infos[SAMPLING_STATE_INFO_KEY] = command.sampling_state_dict()
+    return checkpoint_infos
+
+
+def _wandb_step_offset(current_wandb_step: int, current_training_iteration: int, resume: bool = False) -> int:
+    """Return the smallest fixed offset that prevents W&B step regression."""
+
+    min_offset = 2 if resume else 1
+    return max(min_offset, int(current_wandb_step) - int(current_training_iteration))
+
+
+def _install_wandb_step_guard(runner: OnPolicyRunner) -> None:
+    """Translate writer steps when W&B initialization or resume is already ahead."""
+
+    if (
+        getattr(runner, "_wandb_step_guard_installed", False)
+        or not _is_wandb_logger(runner)
+        or wandb.run is None
+        or getattr(runner, "writer", None) is None
+    ):
+        return
+
+    offset = _wandb_step_offset(
+        wandb.run.step,
+        runner.current_learning_iteration,
+        resume=bool(runner.cfg.get("resume", False)),
+    )
+    original_add_scalar = runner.writer.add_scalar
+
+    def add_scalar_with_monotonic_step(tag, scalar_value, global_step=None, walltime=None, new_style=False):
+        mapped_step = None if global_step is None else int(global_step) + offset
+        return original_add_scalar(
+            tag,
+            scalar_value,
+            global_step=mapped_step,
+            walltime=walltime,
+            new_style=new_style,
+        )
+
+    runner.writer.add_scalar = add_scalar_with_monotonic_step
+    runner._wandb_step_offset = offset
+    runner._wandb_step_guard_installed = True
+
+
+def _sync_wandb_metadata(runner: OnPolicyRunner) -> None:
+    """Apply the requested name and flat metadata after RSL-RL initializes W&B."""
+
+    if not _is_wandb_logger(runner) or wandb.run is None:
+        return
+    _install_wandb_step_guard(runner)
+    if getattr(runner, "_wandb_metadata_synced", False):
+        return
+    run_name = runner.cfg.get("wandb_run_name") or runner.cfg.get("run_name")
+    if run_name:
+        wandb.run.name = run_name
+    metadata = runner.cfg.get("wandb_metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise TypeError("wandb_metadata must be a mapping.")
+    wandb.config.update(dict(metadata), allow_val_change=True)
+    runner._wandb_metadata_synced = True
+
+
+def _restore_sampling_state(runner: OnPolicyRunner, infos, checkpoint_path: str) -> None:
+    command = _motion_command(runner)
+    if command is None:
+        return
+    if not isinstance(infos, Mapping) or SAMPLING_STATE_INFO_KEY not in infos:
+        warnings.warn(
+            f"Checkpoint '{checkpoint_path}' has no sampling state; initializing statistics from the active "
+            "environment assignments.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        command.reset_sampling_statistics()
+        command.record_current_sampling_assignments()
+        return
+    sampling_state = infos[SAMPLING_STATE_INFO_KEY]
+    if not isinstance(sampling_state, Mapping):
+        raise ValueError(f"Checkpoint field '{SAMPLING_STATE_INFO_KEY}' must be a mapping.")
+    command.load_sampling_state_dict(sampling_state)
+    # RslRlVecEnvWrapper resets the environment before runner.load().  Those
+    # active assignments are real work for the resumed process, so add them on
+    # top of the restored cumulative counters after the overwrite.
+    command.record_current_sampling_assignments()
+
+
 class MyOnPolicyRunner(OnPolicyRunner):
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         super().__init__(env, _adapt_rsl_rl_cfg(train_cfg), log_dir, device)
@@ -115,10 +229,15 @@ class MotionOnPolicyRunner(OnPolicyRunner):
     ):
         super().__init__(env, _adapt_rsl_rl_cfg(train_cfg), log_dir, device)
         self.registry_name = registry_name
+        self._wandb_metadata_synced = False
+        self._wandb_step_guard_installed = False
+        self._wandb_step_offset = 0
 
     def save(self, path: str, infos=None):
         """Save the model and training information."""
-        _save_checkpoint_without_wandb_upload(self, path, infos)
+        _sync_wandb_metadata(self)
+        checkpoint_infos = _checkpoint_infos_with_sampling_state(self, infos)
+        _save_checkpoint_without_wandb_upload(self, path, checkpoint_infos)
         if _is_wandb_logger(self):
             policy_path = path.split("model")[0]
             filename = policy_path.split("/")[-2] + ".onnx"
@@ -138,3 +257,28 @@ class MotionOnPolicyRunner(OnPolicyRunner):
             if self.registry_name is not None:
                 wandb.run.use_artifact(self.registry_name)
                 self.registry_name = None
+
+    def load(self, path: str, load_optimizer: bool = True):
+        """Load the model, then restore compatible shared sampling statistics."""
+
+        infos = super().load(path, load_optimizer=load_optimizer)
+        _restore_sampling_state(self, infos, path)
+        return infos
+
+    def log(self, locs: dict, width: int = 80, pad: int = 35):
+        """Log normal RSL-RL values plus rate-limited sampling summaries."""
+
+        _sync_wandb_metadata(self)
+        super().log(locs, width=width, pad=pad)
+        command = _motion_command(self)
+        if command is None or not command.cfg.research.sampling_statistics.enabled:
+            return
+        iteration = int(locs["it"])
+        interval = int(command.cfg.research.sampling_statistics.log_interval)
+        if iteration % interval != 0:
+            return
+        metrics = command.sampling_metrics()
+        if metrics is None:
+            return
+        for name, value in metrics.items():
+            self.writer.add_scalar(f"sampling/{name}", value, iteration)
