@@ -23,6 +23,9 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument(
+    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
+)
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
@@ -106,12 +109,21 @@ def _build_research_metadata(env_cfg) -> dict:
         "segment_enabled": research.segment.enabled,
         "segment_length_seconds": research.segment.length_seconds,
         "quality_gate_enabled": research.quality_gate.enabled,
+        "quality_gate_metadata_path": research.quality_gate.metadata_path or None,
+        "quality_gate_reject_statuses": list(research.quality_gate.reject_statuses),
+        "quality_gate_include_borderline": research.quality_gate.include_borderline,
+        "quality_gate_strict_metadata_match": research.quality_gate.strict_metadata_match,
+        "quality_gate_empty_motion_policy": research.quality_gate.empty_motion_policy,
+        "quality_gate_scope": research.quality_gate.gate_scope,
         "difficulty_calibration_enabled": research.difficulty_calibration.enabled,
         "motion_sampling_mode": research.motion_sampling.mode,
         "segment_sampling_mode": research.segment_sampling.mode,
         "diversity_constraint_enabled": research.diversity_constraint.enabled,
         "sampling_statistics_enabled": research.sampling_statistics.enabled,
         "sampling_statistics_log_interval": research.sampling_statistics.log_interval,
+        "assignment_trace_enabled": research.assignment_trace.enabled,
+        "assignment_trace_output_path": research.assignment_trace.output_path or None,
+        "assignment_trace_max_entries": research.assignment_trace.max_entries,
         "probability_validation_epsilon": research.probability_validation.epsilon,
     }
 
@@ -173,6 +185,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.disable_fabric:
+        env_cfg.sim.use_fabric = False
 
     registry_name = None
     if args_cli.registry_name is not None:

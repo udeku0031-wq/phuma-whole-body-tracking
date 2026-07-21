@@ -6,6 +6,7 @@ library.  It can therefore be tested without launching Isaac Sim.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import math
 import os
@@ -253,6 +254,224 @@ class FixedLengthSegmentIndex:
             raise ValueError("Checkpoint motion_fps does not match the current motion pool.")
 
 
+class QualityGatedStartIndex:
+    """Compact deterministic mapping from uniforms to quality-eligible starts.
+
+    The caller owns quality semantics and passes one boolean value per global
+    segment.  For example, it may combine ``pass`` and ``borderline`` into the
+    allowed mask.  This class only intersects that mask with the legacy start
+    domain ``[0, motion_length - 1)`` and builds compact prefix counts; it does
+    not materialize every frame and never draws random numbers.
+
+    Every tensor stored here is derived from ``segment_index`` and
+    ``segment_allowed_mask``.  There is deliberately no separate checkpoint
+    state or mutable counter to persist.
+    """
+
+    _EMPTY_MOTION_POLICIES = frozenset({"error", "exclude"})
+
+    def __init__(
+        self,
+        segment_index: FixedLengthSegmentIndex,
+        segment_allowed_mask: Sequence[bool] | torch.Tensor,
+        *,
+        empty_motion_policy: str = "error",
+    ) -> None:
+        if empty_motion_policy not in self._EMPTY_MOTION_POLICIES:
+            raise ValueError(
+                "empty_motion_policy must be one of "
+                f"{sorted(self._EMPTY_MOTION_POLICIES)}, got {empty_motion_policy!r}."
+            )
+
+        self.segment_index = segment_index
+        self.device = segment_index.device
+        self.empty_motion_policy = empty_motion_policy
+
+        allowed_mask = torch.as_tensor(segment_allowed_mask, device=self.device)
+        if allowed_mask.dtype != torch.bool:
+            raise ValueError("segment_allowed_mask must contain boolean values.")
+        if allowed_mask.ndim != 1 or allowed_mask.numel() != segment_index.num_segments:
+            raise ValueError(
+                "segment_allowed_mask must be one-dimensional with exactly "
+                f"{segment_index.num_segments} values."
+            )
+        self.segment_allowed_mask = allowed_mask.detach().clone()
+
+        segment_motion_ids = segment_index.segment_motion_ids
+        # The legacy sampler maps [0, 1) to integer frames 0..T-2.  Intersect
+        # each half-open segment range with that domain.  In particular, a
+        # one-frame tail at frame T-1 contributes zero eligible starts.
+        legacy_end_frames = torch.minimum(
+            segment_index.segment_end_frames,
+            segment_index.motion_lengths[segment_motion_ids] - 1,
+        )
+        ungated_start_counts = (
+            legacy_end_frames - segment_index.segment_start_frames
+        ).clamp_min(0)
+        self.segment_eligible_start_counts = torch.where(
+            self.segment_allowed_mask,
+            ungated_start_counts,
+            torch.zeros_like(ungated_start_counts),
+        )
+        self.eligible_segment_mask = self.segment_eligible_start_counts > 0
+
+        self.motion_eligible_start_counts = torch.zeros(
+            segment_index.num_motions, dtype=torch.long, device=self.device
+        )
+        self.motion_eligible_start_counts.scatter_add_(
+            0, segment_motion_ids, self.segment_eligible_start_counts
+        )
+        self.motion_eligible_segment_counts = torch.zeros(
+            segment_index.num_motions, dtype=torch.long, device=self.device
+        )
+        self.motion_eligible_segment_counts.scatter_add_(
+            0, segment_motion_ids, self.eligible_segment_mask.to(torch.long)
+        )
+
+        self.eligible_motion_mask = self.motion_eligible_start_counts > 0
+        self.eligible_motion_ids = torch.where(self.eligible_motion_mask)[0]
+        self.empty_motion_ids = torch.where(~self.eligible_motion_mask)[0]
+        if empty_motion_policy == "error" and self.empty_motion_ids.numel() > 0:
+            empty_ids = self.empty_motion_ids.detach().cpu().tolist()
+            raise ValueError(
+                "Every motion must have at least one quality-eligible legacy start frame in [0, T-2]; "
+                f"empty motion IDs: {empty_ids}."
+            )
+
+        # A global ordinal identifies one eligible start without rejection.
+        # Repeated prefix values correspond to rejected or zero-length ranges;
+        # searchsorted(..., right=True) skips them in one vectorized operation.
+        self.motion_eligible_start_offsets = torch.zeros(
+            segment_index.num_motions + 1, dtype=torch.long, device=self.device
+        )
+        self.motion_eligible_start_offsets[1:] = torch.cumsum(
+            self.motion_eligible_start_counts, dim=0
+        )
+        self.segment_eligible_start_prefix_ends = torch.cumsum(
+            self.segment_eligible_start_counts, dim=0
+        )
+        self.segment_eligible_start_prefix_starts = (
+            self.segment_eligible_start_prefix_ends - self.segment_eligible_start_counts
+        )
+
+    def map_uniform_samples(
+        self,
+        motion_ids: Sequence[int] | torch.Tensor,
+        uniform_samples: Sequence[float] | torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Map caller-provided ``[0, 1)`` samples to eligible start frames.
+
+        Returns ``(start_frames, local_segment_ids, global_segment_ids)`` with
+        the same shape as the inputs.  The operation is deterministic and
+        vectorized; callers remain responsible for drawing both motion IDs and
+        uniform samples.
+        """
+
+        motion_ids_tensor = torch.as_tensor(motion_ids, dtype=torch.long, device=self.device)
+        uniform_samples_tensor = torch.as_tensor(uniform_samples, device=self.device)
+        if not uniform_samples_tensor.is_floating_point():
+            raise ValueError("uniform_samples must be floating-point values in [0, 1).")
+        FixedLengthSegmentIndex._require_same_shape(
+            motion_ids_tensor, uniform_samples_tensor, "motion_ids", "uniform_samples"
+        )
+        self.segment_index._validate_motion_ids(motion_ids_tensor)
+        if uniform_samples_tensor.numel() and (
+            not torch.all(torch.isfinite(uniform_samples_tensor))
+            or torch.any(uniform_samples_tensor < 0.0)
+            or torch.any(uniform_samples_tensor >= 1.0)
+        ):
+            raise ValueError("uniform_samples must be finite values in [0, 1).")
+
+        original_shape = motion_ids_tensor.shape
+        motion_ids_flat = motion_ids_tensor.reshape(-1)
+        uniform_samples_flat = uniform_samples_tensor.reshape(-1)
+        if motion_ids_flat.numel() == 0:
+            empty = torch.empty(original_shape, dtype=torch.long, device=self.device)
+            return empty, empty.clone(), empty.clone()
+
+        selected_motion_counts = self.motion_eligible_start_counts[motion_ids_flat]
+        if torch.any(selected_motion_counts == 0):
+            empty_selected = torch.unique(motion_ids_flat[selected_motion_counts == 0])
+            empty_ids = empty_selected.detach().cpu().tolist()
+            raise ValueError(
+                "Cannot map a uniform sample for a motion with no quality-eligible legacy start frame; "
+                f"motion IDs: {empty_ids}."
+            )
+
+        # Keeping the multiplication in the caller's floating-point dtype
+        # reproduces the legacy `(phase * (length - 1).float()).long()` mapping
+        # when every segment is allowed.  The clamp only guards extreme
+        # floating-point rounding at very large frame counts.
+        local_start_ordinals = (
+            uniform_samples_flat * selected_motion_counts.to(uniform_samples_flat.dtype)
+        ).to(torch.long)
+        local_start_ordinals = torch.minimum(local_start_ordinals, selected_motion_counts - 1)
+        global_start_ordinals = (
+            self.motion_eligible_start_offsets[motion_ids_flat] + local_start_ordinals
+        )
+
+        global_segment_ids = torch.searchsorted(
+            self.segment_eligible_start_prefix_ends,
+            global_start_ordinals,
+            right=True,
+        )
+        start_frames = (
+            self.segment_index.segment_start_frames[global_segment_ids]
+            + global_start_ordinals
+            - self.segment_eligible_start_prefix_starts[global_segment_ids]
+        )
+        local_segment_ids = self.segment_index.segment_local_ids[global_segment_ids]
+        return (
+            start_frames.reshape(original_shape),
+            local_segment_ids.reshape(original_shape),
+            global_segment_ids.reshape(original_shape),
+        )
+
+    def summary(self) -> dict[str, float | int]:
+        """Return low-cardinality eligibility counts derived from the mask."""
+
+        num_legacy_starts = int((self.segment_index.motion_lengths - 1).sum().item())
+        num_eligible_starts = int(self.motion_eligible_start_counts.sum().item())
+        num_eligible_motions = int(torch.count_nonzero(self.eligible_motion_mask).item())
+        num_empty_motions = int(self.empty_motion_ids.numel())
+        return {
+            "num_motions": self.segment_index.num_motions,
+            "num_segments": self.segment_index.num_segments,
+            "num_allowed_segments": int(torch.count_nonzero(self.segment_allowed_mask).item()),
+            "num_eligible_segments": int(torch.count_nonzero(self.eligible_segment_mask).item()),
+            "num_eligible_motions": num_eligible_motions,
+            "num_empty_motions": num_empty_motions,
+            "num_excluded_motions": num_empty_motions,
+            "num_legacy_start_frames": num_legacy_starts,
+            "num_eligible_start_frames": num_eligible_starts,
+            "eligible_motion_fraction": num_eligible_motions / self.segment_index.num_motions,
+            "eligible_start_fraction": (
+                float(num_eligible_starts) / num_legacy_starts if num_legacy_starts else 0.0
+            ),
+        }
+
+    def eligible_motion_mask_sha256(self) -> str:
+        """Return a stable identity hash for the runtime eligible-motion mask."""
+
+        mask_bytes = bytes(
+            int(value)
+            for value in self.eligible_motion_mask.to(dtype=torch.uint8).detach().cpu().tolist()
+        )
+        return hashlib.sha256(mask_bytes).hexdigest()
+
+    def identity_state(self) -> dict[str, int | str]:
+        """Return runtime gate identity fields for checkpoint compatibility."""
+
+        summary = self.summary()
+        return {
+            "empty_motion_policy": self.empty_motion_policy,
+            "manifest_motion_count": int(summary["num_motions"]),
+            "effective_motion_count": int(summary["num_eligible_motions"]),
+            "excluded_motion_count": int(summary["num_excluded_motions"]),
+            "eligible_motion_mask_sha256": self.eligible_motion_mask_sha256(),
+        }
+
+
 class SamplingStatistics:
     """Global, vectorized assignment counters shared by all environments."""
 
@@ -389,6 +608,107 @@ class SamplingStatistics:
         self.segment_sample_count.copy_(segment_counts)
         self.total_assignments.copy_(total)
         self.invalid_probability_fallback_count.copy_(fallback_count)
+
+
+class AssignmentTraceRecorder:
+    """Write a bounded, deterministic CSV trace of assignment-start samples.
+
+    The recorder is intentionally an observer: callers pass already-sampled
+    tensors to it, and it performs only shape checks, host copies, and file I/O.
+    It must never draw random numbers or alter the tensors used by training.
+    """
+
+    HEADER = (
+        "assignment_index",
+        "env_id",
+        "motion_id",
+        "start_frame",
+        "local_segment_id",
+        "global_segment_id",
+        "pool_fingerprint",
+        "run_label",
+    )
+
+    def __init__(
+        self,
+        output_path: str,
+        max_entries: int,
+        *,
+        pool_fingerprint: str | None = None,
+        run_label: str = "",
+    ) -> None:
+        if not output_path:
+            raise ValueError("Assignment trace output_path must not be empty.")
+        if int(max_entries) < 1:
+            raise ValueError("Assignment trace max_entries must be at least 1.")
+        self.output_path = os.path.abspath(os.path.normpath(os.path.expanduser(output_path)))
+        self.max_entries = int(max_entries)
+        self.pool_fingerprint = pool_fingerprint or ""
+        self.run_label = run_label
+        self.recorded_entries = 0
+        self.reset()
+
+    def reset(self) -> None:
+        directory = os.path.dirname(self.output_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(self.output_path, "w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(self.HEADER)
+        self.recorded_entries = 0
+
+    def record_assignments(
+        self,
+        env_ids: Sequence[int] | torch.Tensor,
+        motion_ids: Sequence[int] | torch.Tensor,
+        start_frames: Sequence[int] | torch.Tensor,
+        local_segment_ids: Sequence[int] | torch.Tensor,
+        global_segment_ids: Sequence[int] | torch.Tensor,
+    ) -> int:
+        if self.recorded_entries >= self.max_entries:
+            return 0
+
+        tensors = [
+            torch.as_tensor(values, dtype=torch.long).reshape(-1).detach().cpu()
+            for values in (env_ids, motion_ids, start_frames, local_segment_ids, global_segment_ids)
+        ]
+        num_items = tensors[0].numel()
+        if any(tensor.numel() != num_items for tensor in tensors[1:]):
+            raise ValueError("Assignment trace tensors must have the same number of elements.")
+        if num_items == 0:
+            return 0
+
+        num_to_write = min(num_items, self.max_entries - self.recorded_entries)
+        rows = zip(
+            range(self.recorded_entries, self.recorded_entries + num_to_write),
+            *(tensor[:num_to_write].tolist() for tensor in tensors),
+            strict=True,
+        )
+        with open(self.output_path, "a", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            for assignment_index, env_id, motion_id, start_frame, local_id, global_id in rows:
+                writer.writerow(
+                    (
+                        assignment_index,
+                        env_id,
+                        motion_id,
+                        start_frame,
+                        local_id,
+                        global_id,
+                        self.pool_fingerprint,
+                        self.run_label,
+                    )
+                )
+        self.recorded_entries += num_to_write
+        return num_to_write
+
+    def summary(self) -> dict[str, int | str]:
+        return {
+            "output_path": self.output_path,
+            "max_entries": self.max_entries,
+            "recorded_entries": self.recorded_entries,
+            "pool_fingerprint": self.pool_fingerprint,
+        }
 
 
 def normalize_and_validate_probabilities(

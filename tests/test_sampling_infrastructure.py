@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import csv
 import importlib.util
+import tempfile
 import unittest
 import warnings
 from pathlib import Path
@@ -253,6 +255,83 @@ class SamplingStatisticsTest(unittest.TestCase):
             ["/new/root/motions/a.npz", "/new/root/motions/sub/b.npz"], [100, 60], [50.0, 30.0]
         )
         self.assertEqual(first, moved)
+
+
+class AssignmentTraceRecorderTest(unittest.TestCase):
+    def test_records_bounded_csv_without_consuming_rng(self) -> None:
+        index = sampling.FixedLengthSegmentIndex([100, 60], [50.0, 30.0])
+        motion_ids = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+        start_frames = torch.tensor([0, 75, 0, 45], dtype=torch.long)
+        local_ids, global_ids = index.motion_frame_to_segment(motion_ids, start_frames)
+
+        with tempfile.TemporaryDirectory() as directory:
+            trace_path = Path(directory) / "assignment_trace.csv"
+            recorder = sampling.AssignmentTraceRecorder(
+                str(trace_path),
+                max_entries=3,
+                pool_fingerprint="pool-fixture",
+                run_label="M0",
+            )
+
+            before = torch.random.get_rng_state()
+            written = recorder.record_assignments(
+                torch.tensor([3, 2, 1, 0], dtype=torch.long),
+                motion_ids,
+                start_frames,
+                local_ids,
+                global_ids,
+            )
+            after = torch.random.get_rng_state()
+
+            self.assertEqual(written, 3)
+            self.assertTrue(torch.equal(before, after))
+            self.assertEqual(recorder.summary()["recorded_entries"], 3)
+
+            # The recorder is bounded; later calls must not append beyond max_entries.
+            self.assertEqual(
+                recorder.record_assignments([9], [0], [0], [0], [0]),
+                0,
+            )
+
+            with trace_path.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(
+                list(rows[0]),
+                [
+                    "assignment_index",
+                    "env_id",
+                    "motion_id",
+                    "start_frame",
+                    "local_segment_id",
+                    "global_segment_id",
+                    "pool_fingerprint",
+                    "run_label",
+                ],
+            )
+            self.assertEqual(rows[0]["assignment_index"], "0")
+            self.assertEqual(rows[0]["env_id"], "3")
+            self.assertEqual(rows[1]["motion_id"], "0")
+            self.assertEqual(rows[1]["start_frame"], "75")
+            self.assertEqual(rows[2]["global_segment_id"], "2")
+            self.assertEqual(rows[2]["pool_fingerprint"], "pool-fixture")
+            self.assertEqual(rows[2]["run_label"], "M0")
+
+            recorder.reset()
+            with trace_path.open(newline="", encoding="utf-8") as stream:
+                self.assertEqual(list(csv.DictReader(stream)), [])
+            self.assertEqual(recorder.summary()["recorded_entries"], 0)
+
+    def test_rejects_invalid_trace_configuration_and_shapes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "output_path"):
+            sampling.AssignmentTraceRecorder("", max_entries=1)
+        with self.assertRaisesRegex(ValueError, "max_entries"):
+            sampling.AssignmentTraceRecorder("/tmp/trace.csv", max_entries=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = sampling.AssignmentTraceRecorder(str(Path(directory) / "trace.csv"), 4)
+            with self.assertRaisesRegex(ValueError, "same number"):
+                recorder.record_assignments([0, 1], [0], [0], [0], [0])
 
 
 class ProbabilityValidationTest(unittest.TestCase):
