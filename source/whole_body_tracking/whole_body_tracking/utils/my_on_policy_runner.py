@@ -174,7 +174,14 @@ def _sync_wandb_metadata(runner: OnPolicyRunner) -> None:
     metadata = runner.cfg.get("wandb_metadata", {})
     if not isinstance(metadata, Mapping):
         raise TypeError("wandb_metadata must be a mapping.")
-    wandb.config.update(dict(metadata), allow_val_change=True)
+    resolved_metadata = dict(metadata)
+    command = _motion_command(runner)
+    if command is not None and hasattr(command, "wandb_research_metadata"):
+        command_metadata = command.wandb_research_metadata()
+        if not isinstance(command_metadata, Mapping):
+            raise TypeError("Motion command W&B metadata must be a mapping.")
+        resolved_metadata.update(command_metadata)
+    wandb.config.update(resolved_metadata, allow_val_change=True)
     runner._wandb_metadata_synced = True
 
 
@@ -266,7 +273,7 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         return infos
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
-        """Log normal RSL-RL values plus rate-limited sampling summaries."""
+        """Log normal RSL-RL values plus rate-limited sampling/quality summaries."""
 
         _sync_wandb_metadata(self)
         super().log(locs, width=width, pad=pad)
@@ -282,3 +289,13 @@ class MotionOnPolicyRunner(OnPolicyRunner):
             return
         for name, value in metrics.items():
             self.writer.add_scalar(f"sampling/{name}", value, iteration)
+        if hasattr(command, "quality_metrics"):
+            quality_metrics = command.quality_metrics()
+            if quality_metrics is not None:
+                for name, value in quality_metrics.items():
+                    self.writer.add_scalar(f"quality/{name}", value, iteration)
+        if hasattr(command, "dataset_metrics"):
+            dataset_metrics = command.dataset_metrics()
+            if dataset_metrics is not None:
+                for name, value in dataset_metrics.items():
+                    self.writer.add_scalar(f"dataset/{name}", value, iteration)

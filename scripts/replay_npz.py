@@ -23,6 +23,13 @@ motion_source.add_argument("--registry_name", type=str, help="The name of the wa
 motion_source.add_argument("--motion_file", type=str, help="Path to a local WBT motion .npz file.")
 parser.add_argument("--max_steps", type=int, default=None, help="Maximum replay steps before exiting.")
 parser.add_argument("--progress_interval", type=int, default=500, help="Print replay progress every N steps.")
+parser.add_argument("--start_frame", type=int, default=0, help="First motion frame to replay (inclusive).")
+parser.add_argument(
+    "--end_frame_exclusive",
+    type=int,
+    default=None,
+    help="Frame at which replay wraps (exclusive). Defaults to the motion length.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -95,23 +102,35 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         torch.tensor([0], dtype=torch.long, device=sim.device),
         sim.device,
     )
+    motion_length = int(motion.time_step_total)
+    start_frame = args_cli.start_frame
+    end_frame_exclusive = args_cli.end_frame_exclusive
+    if end_frame_exclusive is None:
+        end_frame_exclusive = motion_length
+    if not 0 <= start_frame < end_frame_exclusive <= motion_length:
+        raise ValueError(
+            "Invalid replay frame range "
+            f"[{start_frame}, {end_frame_exclusive}) for motion length {motion_length}; "
+            "expected 0 <= start_frame < end_frame_exclusive <= motion length."
+        )
     print(
-        f"[INFO]: Replay started. Motion steps: {motion.time_step_total}. "
+        f"[INFO]: Replay started. Motion steps: {motion_length}. "
+        f"Frame range: [{start_frame}, {end_frame_exclusive}). "
         "Press Ctrl+C to stop, or use --max_steps for a finite test.",
         flush=True,
     )
-    time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
+    time_steps = torch.full((scene.num_envs,), start_frame - 1, dtype=torch.long, device=sim.device)
     replay_steps = 0
 
     # Simulation loop
     while simulation_app.is_running():
         replay_steps += 1
         time_steps += 1
-        reset_ids = time_steps >= motion.time_step_total
-        time_steps[reset_ids] = 0
+        reset_ids = time_steps >= end_frame_exclusive
+        time_steps[reset_ids] = start_frame
 
         root_states = robot.data.default_root_state.clone()
-        root_states[:, :3] = motion.body_pos_w[time_steps][:, 0] + scene.env_origins[:, None, :]
+        root_states[:, :3] = motion.body_pos_w[time_steps][:, 0] + scene.env_origins
         root_states[:, 3:7] = motion.body_quat_w[time_steps][:, 0]
         root_states[:, 7:10] = motion.body_lin_vel_w[time_steps][:, 0]
         root_states[:, 10:] = motion.body_ang_vel_w[time_steps][:, 0]

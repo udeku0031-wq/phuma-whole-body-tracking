@@ -329,6 +329,54 @@ W&B storage rule: keep `WBT_DISABLE_ONNX_ON_SAVE=1` for routine training and do
 not set `WBT_ENABLE_WANDB_MODEL_SAVE=1` unless a cloud checkpoint upload is
 intentionally needed. Checkpoints remain saved locally under `logs/rsl_rl/...`.
 
+### Segment Research Modules
+
+The shared fixed-duration Segment infrastructure (Stage 0) and the first
+quality-only module (M1) are now available:
+
+- [Stage 0 Segment infrastructure](docs/stage0_segment_infrastructure.md)
+- [Module 1 quality audit and quality gate](docs/module1_quality_gate.md)
+
+Module 1 audits the final converted WBT/G1 trajectories offline, writes frozen
+segment metadata, validates it against the exact ordered Train manifest, and
+excludes `reject` segments from assignment-start sampling. Its thresholds are
+currently marked `provisional`; run the documented offline statistics and
+manual replay review before freezing or starting a formal M1 experiment.
+
+Data-pool rule for the module experiments: keep the original
+`PHUMA_wbt_motions/manifests/experiments/random_seed42/random6000_seed42.txt`
+manifest unchanged. The audit script only writes metadata and an explicitly
+named `normalized_manifest.txt` copy/subset for inspection or prefix pilots; it
+must not delete, replace, or quality-filter motions. Formal M0--M7 experiments
+should all read the same 6000-line random6000 manifest. With
+`quality_gate.enabled=false`, all 6000 motions remain sampleable. With
+`quality_gate.enabled=true` and
+`env.commands.motion.research.quality_gate.empty_motion_policy=exclude`,
+motions that have no pass/borderline legacy start frames stay in the manifest
+and metadata but receive zero runtime sampling probability. For the current
+original random6000 metadata this means M1/M6/M7 report
+`dataset/manifest_motion_count=6000` and `dataset/effective_motion_count=5998`;
+that 5998 is a runtime eligible-motion count, not a separate 5998-line
+manifest.
+
+The current gate scope is deliberately explicit: a reject segment cannot be an
+assignment start, but an assignment still follows the legacy reference to the
+end of its motion and may later traverse a reject segment. In W&B,
+`quality/reject_start_assignment_count` should stay at zero for M1, while
+`quality/reject_rollout_exposure_ratio` records any later reference-frame
+exposure to reject segments. See the module document for this boundary,
+checkpoint/resume behavior, and the complete M0/M1 pilot commands. Every
+training command there includes:
+
+```bash
+export WANDB_USERNAME=longxianli222-northeastern-university
+export WANDB_ENTITY=longxianli222-northeastern-university
+```
+
+For short RNG-equivalence smoke tests, Module 1 also provides a bounded
+assignment trace switch and `scripts/compare_assignment_traces.py`; keep this
+debug trace disabled for formal training.
+
 ### Policy Evaluation
 
 - Play the trained policy by the following command:

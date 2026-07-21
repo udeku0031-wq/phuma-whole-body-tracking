@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
@@ -24,9 +25,16 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from whole_body_tracking.utils.quality_metadata import (
+    QUALITY_STATUS_TO_CODE,
+    SegmentQualityMetadata,
+    canonical_manifest_entries,
+)
 from whole_body_tracking.utils.sampling import (
+    AssignmentTraceRecorder,
     SAMPLING_STATE_VERSION,
     FixedLengthSegmentIndex,
+    QualityGatedStartIndex,
     SamplingStatistics,
     motion_pool_fingerprint,
 )
@@ -40,6 +48,11 @@ class MotionLoader:
         self.motion_file = motion_file
         self._body_indexes = body_indexes
         self.motion_files = self._resolve_motion_files(motion_file)
+        self.motion_keys = (
+            canonical_manifest_entries(motion_file)
+            if os.path.isfile(motion_file) and motion_file.endswith(".txt")
+            else [os.path.basename(path) for path in self.motion_files]
+        )
         loaded = [self._load_npz(path) for path in self.motion_files]
 
         self.fps = loaded[0]["fps"]
@@ -251,35 +264,80 @@ class MotionLoader:
         return self._body_ang_vel_w[:, self._body_indexes]
 
 
-def _validate_stage0_research_config(cfg: ResearchExperimentCfg) -> None:
-    """Fail fast when a configuration requests algorithms not implemented in stage 0."""
+def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
+    """Validate the implemented M0/M1 combinations and reject future modules."""
 
-    if cfg.method_name != "M0":
+    if cfg.method_name not in {"M0", "M1"}:
         raise NotImplementedError(
-            f"Research method '{cfg.method_name}' is not implemented in stage 0; only method_name='M0' is available."
+            f"Research method '{cfg.method_name}' is not implemented yet; use 'M0' or 'M1'."
         )
-    if cfg.quality_gate.enabled:
-        raise NotImplementedError("quality_gate.enabled=True is not implemented in stage 0.")
+    if cfg.method_name == "M0" and cfg.quality_gate.enabled:
+        raise ValueError("method_name='M0' requires quality_gate.enabled=False.")
+    if cfg.method_name == "M1" and not cfg.quality_gate.enabled:
+        raise ValueError("method_name='M1' requires quality_gate.enabled=True.")
     if cfg.difficulty_calibration.enabled:
-        raise NotImplementedError("difficulty_calibration.enabled=True is not implemented in stage 0.")
+        raise NotImplementedError("difficulty_calibration.enabled=True is not implemented in module 1.")
     if cfg.diversity_constraint.enabled:
-        raise NotImplementedError("diversity_constraint.enabled=True is not implemented in stage 0.")
+        raise NotImplementedError("diversity_constraint.enabled=True is not implemented in module 1.")
     if cfg.motion_sampling.mode != "uniform":
         raise NotImplementedError(
-            f"motion_sampling mode '{cfg.motion_sampling.mode}' is not implemented in stage 0; use 'uniform'."
+            f"motion_sampling mode '{cfg.motion_sampling.mode}' is not implemented in module 1; use 'uniform'."
         )
     if cfg.segment_sampling.mode != "uniform":
         raise NotImplementedError(
-            f"segment_sampling mode '{cfg.segment_sampling.mode}' is not implemented in stage 0; use 'uniform'."
+            f"segment_sampling mode '{cfg.segment_sampling.mode}' is not implemented in module 1; use 'uniform'."
         )
     if not math.isfinite(cfg.segment.length_seconds) or cfg.segment.length_seconds <= 0.0:
         raise ValueError("segment.length_seconds must be finite and greater than zero.")
+    if cfg.assignment_trace.enabled:
+        if not cfg.segment.enabled:
+            raise ValueError("assignment_trace requires segment.enabled=True.")
+        if not cfg.assignment_trace.output_path:
+            raise ValueError("assignment_trace.output_path is required when assignment_trace.enabled=True.")
+        if cfg.assignment_trace.max_entries < 1:
+            raise ValueError("assignment_trace.max_entries must be at least 1.")
     if cfg.sampling_statistics.enabled and not cfg.segment.enabled:
         raise ValueError("sampling_statistics requires segment.enabled=True in stage 0.")
     if cfg.sampling_statistics.log_interval < 1:
         raise ValueError("sampling_statistics.log_interval must be at least 1.")
     if not math.isfinite(cfg.probability_validation.epsilon) or cfg.probability_validation.epsilon <= 0.0:
         raise ValueError("probability_validation.epsilon must be finite and greater than zero.")
+    if cfg.quality_gate.enabled:
+        if not cfg.segment.enabled:
+            raise ValueError("quality_gate requires segment.enabled=True.")
+        if not cfg.sampling_statistics.enabled:
+            raise ValueError("quality_gate requires sampling_statistics.enabled=True for audit counters.")
+        if not cfg.quality_gate.metadata_path:
+            raise ValueError("quality_gate.metadata_path is required when the gate is enabled.")
+        reject_statuses = tuple(cfg.quality_gate.reject_statuses)
+        if len(set(reject_statuses)) != len(reject_statuses):
+            raise ValueError("quality_gate.reject_statuses must not contain duplicates.")
+        unknown_statuses = set(reject_statuses).difference(QUALITY_STATUS_TO_CODE)
+        if unknown_statuses:
+            raise ValueError(f"Unknown quality_gate.reject_statuses: {sorted(unknown_statuses)}")
+        if "reject" not in reject_statuses or "pass" in reject_statuses:
+            raise ValueError("M1 must reject status 'reject' and must never reject status 'pass'.")
+        if cfg.quality_gate.include_borderline and "borderline" in reject_statuses:
+            raise ValueError(
+                "quality_gate.include_borderline=True conflicts with rejecting status 'borderline'."
+            )
+        if cfg.quality_gate.gate_scope != "assignment_start":
+            raise NotImplementedError("Only quality_gate.gate_scope='assignment_start' is implemented.")
+        if cfg.quality_gate.empty_motion_policy not in QualityGatedStartIndex._EMPTY_MOTION_POLICIES:
+            raise ValueError(
+                "quality_gate.empty_motion_policy must be one of "
+                f"{sorted(QualityGatedStartIndex._EMPTY_MOTION_POLICIES)}."
+            )
+
+
+def _canonical_quality_gate_config(config: Mapping[str, object]) -> dict[str, object]:
+    """Normalize quality-gate config identity across module-1 checkpoint revisions."""
+
+    canonical = dict(config)
+    if "empty_motion_policy" not in canonical and "fail_on_empty_motion" in canonical:
+        canonical["empty_motion_policy"] = "error" if canonical["fail_on_empty_motion"] else "exclude"
+    canonical.pop("fail_on_empty_motion", None)
+    return canonical
 
 
 class MotionCommand(CommandTerm):
@@ -287,7 +345,7 @@ class MotionCommand(CommandTerm):
 
     def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        _validate_stage0_research_config(cfg.research)
+        _validate_research_config(cfg.research)
 
         self.robot: Articulation = env.scene[cfg.asset_name]
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body_name)
@@ -311,6 +369,13 @@ class MotionCommand(CommandTerm):
         )
         self.segment_index: FixedLengthSegmentIndex | None = None
         self.sampling_statistics: SamplingStatistics | None = None
+        self.assignment_trace: AssignmentTraceRecorder | None = None
+        self.quality_metadata: SegmentQualityMetadata | None = None
+        self.quality_gate_index: QualityGatedStartIndex | None = None
+        self.quality_status_codes: torch.Tensor | None = None
+        self.quality_metadata_match_ok = False
+        self.quality_reference_frame_count = torch.zeros((), dtype=torch.long, device=self.device)
+        self.quality_reject_reference_frame_count = torch.zeros((), dtype=torch.long, device=self.device)
         if self.cfg.research.segment.enabled:
             self.segment_index = FixedLengthSegmentIndex(
                 self.motion.motion_lengths,
@@ -326,6 +391,20 @@ class MotionCommand(CommandTerm):
                 f"[INFO]: Built {self.segment_index.num_segments} fixed-length segment(s), "
                 f"duration={self.segment_index.segment_length_seconds:g}s"
             )
+            if self.cfg.research.assignment_trace.enabled:
+                self.assignment_trace = AssignmentTraceRecorder(
+                    self.cfg.research.assignment_trace.output_path,
+                    self.cfg.research.assignment_trace.max_entries,
+                    pool_fingerprint=self.motion.pool_fingerprint,
+                    run_label=self.cfg.research.method_name,
+                )
+                print(
+                    "[INFO]: Assignment trace enabled; writing first "
+                    f"{self.cfg.research.assignment_trace.max_entries} assignment(s) to "
+                    f"{self.assignment_trace.output_path}"
+                )
+        if self.cfg.research.quality_gate.enabled:
+            self._initialize_quality_gate()
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.assigned_local_segment_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -353,6 +432,79 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
+
+    def _initialize_quality_gate(self) -> None:
+        """Load frozen quality labels and bind them to the exact segment layout."""
+
+        if self.segment_index is None:
+            raise RuntimeError("Quality gate initialization requires a segment index.")
+        if not self.cfg.motion_file.endswith(".txt") or not os.path.isfile(self.cfg.motion_file):
+            raise ValueError("Quality-gated training requires a local .txt motion manifest.")
+
+        metadata = SegmentQualityMetadata.load(self.cfg.research.quality_gate.metadata_path)
+        metadata_match_ok = metadata.validate_against(
+            manifest_path=self.cfg.motion_file,
+            motion_keys=self.motion.motion_keys,
+            motion_lengths=self.motion.motion_lengths.detach().cpu().tolist(),
+            motion_fps=self.motion.motion_fps.detach().cpu().tolist(),
+            motion_segment_offsets=self.segment_index.motion_segment_offsets.detach().cpu().tolist(),
+            segment_start_frames=self.segment_index.segment_start_frames.detach().cpu().tolist(),
+            segment_end_frames=self.segment_index.segment_end_frames.detach().cpu().tolist(),
+            segment_length_seconds=self.segment_index.segment_length_seconds,
+            segment_schema_version=SAMPLING_STATE_VERSION,
+            pool_fingerprint=self.motion.pool_fingerprint,
+            strict=self.cfg.research.quality_gate.strict_metadata_match,
+        )
+        if not metadata_match_ok:
+            warnings.warn(
+                "Quality metadata mismatch was explicitly allowed by strict_metadata_match=False; "
+                "do not use this run as a formal M1 result.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        status_masks = {
+            "pass": metadata.pass_mask,
+            "borderline": metadata.borderline_mask,
+            "reject": metadata.reject_mask,
+        }
+        rejected_mask = np.zeros(metadata.num_segments, dtype=bool)
+        for status in self.cfg.research.quality_gate.reject_statuses:
+            rejected_mask |= status_masks[status]
+        allowed_mask = ~rejected_mask
+        if not self.cfg.research.quality_gate.include_borderline:
+            allowed_mask &= ~metadata.borderline_mask
+        self.quality_metadata = metadata
+        self.quality_status_codes = torch.as_tensor(
+            metadata.quality_status, dtype=torch.int8, device=self.device
+        )
+        self.quality_gate_index = QualityGatedStartIndex(
+            self.segment_index,
+            torch.as_tensor(allowed_mask, dtype=torch.bool, device=self.device),
+            empty_motion_policy=self.cfg.research.quality_gate.empty_motion_policy,
+        )
+        if self.quality_gate_index.eligible_motion_ids.numel() == 0:
+            raise ValueError("Quality gate excluded every motion; no eligible start frame remains.")
+        self.quality_metadata_match_ok = metadata_match_ok
+        gate_summary = self.quality_gate_index.summary()
+        if gate_summary["num_empty_motions"]:
+            warnings.warn(
+                f"Quality gate found {gate_summary['num_empty_motions']} motion(s) with no eligible start frame; "
+                f"empty_motion_policy='{self.cfg.research.quality_gate.empty_motion_policy}'. "
+                "The manifest and motion loader pool are unchanged; empty motions have zero sampling probability "
+                "only when policy='exclude'.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        print(
+            f"[INFO]: Loaded quality metadata '{metadata.path}' "
+            f"(pass={int(np.count_nonzero(metadata.pass_mask))}, "
+            f"borderline={int(np.count_nonzero(metadata.borderline_mask))}, "
+            f"reject={int(np.count_nonzero(metadata.reject_mask))}, "
+            f"eligible_starts={gate_summary['num_eligible_start_frames']}, "
+            f"empty_motions={gate_summary['num_empty_motions']}, "
+            f"effective_motions={gate_summary['num_eligible_motions']})"
+        )
 
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
@@ -628,6 +780,58 @@ class MotionCommand(CommandTerm):
             local_ids, global_ids = self.sampling_statistics.record_assignments(motion_ids, start_frames)
         self.assigned_local_segment_ids[env_ids] = local_ids
         self.assigned_global_segment_ids[env_ids] = global_ids
+        if self.assignment_trace is not None:
+            self.assignment_trace.record_assignments(env_ids, motion_ids, start_frames, local_ids, global_ids)
+
+    def _record_quality_reference_exposure(self) -> None:
+        """Count current reference frames that lie inside reject segments.
+
+        This is a deterministic observation of ``motion_ids`` and
+        ``time_steps`` after the usual reference clock update.  It does not
+        draw random numbers and it deliberately does not alter reset behavior:
+        ``assignment_start`` still gates only the sampled start frame.
+        """
+
+        if (
+            not self.cfg.research.quality_gate.enabled
+            or self.segment_index is None
+            or self.quality_status_codes is None
+        ):
+            return
+        current_ids = self.current_global_segment_ids
+        if current_ids is None or current_ids.numel() == 0:
+            return
+        reject_code = QUALITY_STATUS_TO_CODE["reject"]
+        self.quality_reference_frame_count += int(current_ids.numel())
+        self.quality_reject_reference_frame_count += int(
+            torch.count_nonzero(self.quality_status_codes[current_ids] == reject_code).item()
+        )
+
+    def _quality_gated_uniform_sampling(self, env_ids: Sequence[int]) -> None:
+        """Uniformly sample motions and quality-eligible legacy start frames."""
+
+        if self.quality_gate_index is None:
+            raise RuntimeError("Quality-gated sampling requested before quality metadata initialization.")
+        num_samples = len(env_ids)
+        eligible_motion_ids = self.quality_gate_index.eligible_motion_ids
+        if eligible_motion_ids.numel() == self.motion.num_motions:
+            sampled_motion_ids = torch.randint(self.motion.num_motions, (num_samples,), device=self.device)
+        else:
+            eligible_indexes = torch.randint(eligible_motion_ids.numel(), (num_samples,), device=self.device)
+            sampled_motion_ids = eligible_motion_ids[eligible_indexes]
+        sampled_phases = sample_uniform(0.0, 1.0, (num_samples,), device=self.device)
+        sampled_start_frames, _, _ = self.quality_gate_index.map_uniform_samples(
+            sampled_motion_ids, sampled_phases
+        )
+        self.motion_ids[env_ids] = sampled_motion_ids
+        self.time_steps[env_ids] = sampled_start_frames
+
+        num_eligible_motions = int(eligible_motion_ids.numel())
+        self.metrics["sampling_entropy"][:] = 1.0
+        self.metrics["sampling_top1_prob"][:] = 1.0 / float(num_eligible_motions)
+        self.metrics["sampling_top1_bin"][env_ids] = sampled_motion_ids.float() / max(
+            self.motion.num_motions - 1, 1
+        )
 
     def _sample_motion_and_start_frame(self, env_ids: Sequence[int]) -> None:
         """Dispatch sampling modes while preserving the legacy uniform RNG path."""
@@ -635,10 +839,13 @@ class MotionCommand(CommandTerm):
         motion_mode = self.cfg.research.motion_sampling.mode
         segment_mode = self.cfg.research.segment_sampling.mode
         if motion_mode == "uniform" and segment_mode == "uniform":
-            self._adaptive_sampling(env_ids)
+            if self.cfg.research.quality_gate.enabled:
+                self._quality_gated_uniform_sampling(env_ids)
+            else:
+                self._adaptive_sampling(env_ids)
             return
         raise NotImplementedError(
-            f"Sampling modes motion='{motion_mode}', segment='{segment_mode}' are not implemented in stage 0."
+            f"Sampling modes motion='{motion_mode}', segment='{segment_mode}' are not implemented in module 1."
         )
 
     def _resample_command(self, env_ids: Sequence[int]):
@@ -652,6 +859,7 @@ class MotionCommand(CommandTerm):
         self.time_steps += 1
         env_ids = torch.where(self.time_steps >= self.motion.motion_lengths[self.motion_ids])[0]
         self._resample_command(env_ids)
+        self._record_quality_reference_exposure()
         self._update_relative_body_targets()
 
         self.bin_failed_count = (
@@ -662,13 +870,31 @@ class MotionCommand(CommandTerm):
     def research_config_dict(self) -> dict[str, object]:
         """Return low-cardinality research configuration for logs and checkpoints."""
 
+        quality_gate_config: dict[str, object] = {"enabled": self.cfg.research.quality_gate.enabled}
+        if self.cfg.research.quality_gate.enabled:
+            if self.quality_metadata is None:
+                raise RuntimeError("Enabled quality gate has no loaded metadata.")
+            quality_gate_config.update(
+                {
+                    "metadata_path": self.quality_metadata.path,
+                    "metadata_sha256": self.quality_metadata.metadata_sha256,
+                    "quality_config_sha256": self.quality_metadata.quality_config_sha256,
+                    "manifest_sha256": self.quality_metadata.manifest_sha256,
+                    "schema_version": self.quality_metadata.schema_version,
+                    "reject_statuses": list(self.cfg.research.quality_gate.reject_statuses),
+                    "include_borderline": self.cfg.research.quality_gate.include_borderline,
+                    "strict_metadata_match": self.cfg.research.quality_gate.strict_metadata_match,
+                    "empty_motion_policy": self.cfg.research.quality_gate.empty_motion_policy,
+                    "gate_scope": self.cfg.research.quality_gate.gate_scope,
+                }
+            )
         return {
             "method_name": self.cfg.research.method_name,
             "segment": {
                 "enabled": self.cfg.research.segment.enabled,
                 "length_seconds": self.cfg.research.segment.length_seconds,
             },
-            "quality_gate": {"enabled": self.cfg.research.quality_gate.enabled},
+            "quality_gate": quality_gate_config,
             "difficulty_calibration": {"enabled": self.cfg.research.difficulty_calibration.enabled},
             "motion_sampling": {"mode": self.cfg.research.motion_sampling.mode},
             "segment_sampling": {"mode": self.cfg.research.segment_sampling.mode},
@@ -677,23 +903,178 @@ class MotionCommand(CommandTerm):
                 "enabled": self.cfg.research.sampling_statistics.enabled,
                 "log_interval": self.cfg.research.sampling_statistics.log_interval,
             },
+            "assignment_trace": {
+                "enabled": self.cfg.research.assignment_trace.enabled,
+                "output_path": self.cfg.research.assignment_trace.output_path,
+                "max_entries": self.cfg.research.assignment_trace.max_entries,
+            },
             "probability_validation": {"epsilon": self.cfg.research.probability_validation.epsilon},
         }
 
     def sampling_metrics(self) -> dict[str, float | int] | None:
         if self.sampling_statistics is None:
             return None
-        return self.sampling_statistics.summary()
+        metrics = self.sampling_statistics.summary()
+        metrics["quality_gate_enabled"] = int(self.cfg.research.quality_gate.enabled)
+        if self.assignment_trace is not None:
+            metrics["assignment_trace_recorded_entries"] = int(self.assignment_trace.recorded_entries)
+        if self.quality_gate_index is None:
+            return metrics
+        if self.quality_status_codes is None or self.quality_metadata is None:
+            raise RuntimeError("Quality gate metrics requested without status metadata.")
+
+        segment_counts = self.sampling_statistics.segment_sample_count
+        pass_code = QUALITY_STATUS_TO_CODE["pass"]
+        borderline_code = QUALITY_STATUS_TO_CODE["borderline"]
+        reject_code = QUALITY_STATUS_TO_CODE["reject"]
+        metrics.update(
+            {
+                "eligible_segment_coverage": float(
+                    torch.count_nonzero(
+                        (segment_counts > 0) & self.quality_gate_index.eligible_segment_mask
+                    ).item()
+                )
+                / max(int(torch.count_nonzero(self.quality_gate_index.eligible_segment_mask).item()), 1),
+                "pass_segment_sample_count": int(
+                    segment_counts[self.quality_status_codes == pass_code].sum().item()
+                ),
+                "borderline_segment_sample_count": int(
+                    segment_counts[self.quality_status_codes == borderline_code].sum().item()
+                ),
+                "reject_segment_sample_count": int(
+                    segment_counts[self.quality_status_codes == reject_code].sum().item()
+                ),
+                "reject_start_assignment_count": int(
+                    segment_counts[self.quality_status_codes == reject_code].sum().item()
+                ),
+            }
+        )
+        current_ids = self.current_global_segment_ids
+        metrics["current_reject_reference_fraction"] = (
+            float((self.quality_status_codes[current_ids] == reject_code).float().mean().item())
+            if current_ids is not None and current_ids.numel()
+            else 0.0
+        )
+        return metrics
+
+    def dataset_metrics(self) -> dict[str, float | int]:
+        """Return runtime dataset-pool sizes shared by M0/M1 logging."""
+
+        manifest_motion_count = int(self.motion.num_motions)
+        if self.quality_gate_index is None:
+            effective_motion_count = manifest_motion_count
+        else:
+            effective_motion_count = int(self.quality_gate_index.eligible_motion_ids.numel())
+        excluded_motion_count = manifest_motion_count - effective_motion_count
+        return {
+            "manifest_motion_count": manifest_motion_count,
+            "effective_motion_count": effective_motion_count,
+            "excluded_motion_count": excluded_motion_count,
+            "eligible_motion_ratio": effective_motion_count / manifest_motion_count
+            if manifest_motion_count
+            else 0.0,
+        }
+
+    def quality_metrics(self) -> dict[str, float | int] | None:
+        """Return static quality-pool metrics without uploading segment arrays."""
+
+        if self.quality_metadata is None or self.quality_gate_index is None:
+            return None
+        metrics = self.quality_metadata.quality_metrics()
+        manifest_motion_count = int(self.motion.num_motions)
+        effective_motion_count = int(self.quality_gate_index.eligible_motion_ids.numel())
+        excluded_motion_count = manifest_motion_count - effective_motion_count
+        metrics["manifest_motion_count"] = manifest_motion_count
+        metrics["effective_motion_count"] = effective_motion_count
+        metrics["num_empty_eligible_motions"] = int(self.quality_gate_index.empty_motion_ids.numel())
+        metrics["excluded_motion_count"] = excluded_motion_count
+        metrics["eligible_motion_ratio"] = (
+            effective_motion_count / manifest_motion_count if manifest_motion_count else 0.0
+        )
+        metrics["metadata_match_ok"] = int(self.quality_metadata_match_ok)
+        reject_code = QUALITY_STATUS_TO_CODE["reject"]
+        reject_start_count = 0
+        if self.sampling_statistics is not None and self.quality_status_codes is not None:
+            reject_start_count = int(
+                self.sampling_statistics.segment_sample_count[
+                    self.quality_status_codes == reject_code
+                ].sum().item()
+            )
+        reference_count = int(self.quality_reference_frame_count.item())
+        reject_reference_count = int(self.quality_reject_reference_frame_count.item())
+        metrics["reject_start_assignment_count"] = reject_start_count
+        metrics["reject_reference_frame_count"] = reject_reference_count
+        metrics["reference_frame_count"] = reference_count
+        metrics["reject_rollout_exposure_ratio"] = (
+            float(reject_reference_count) / reference_count if reference_count else 0.0
+        )
+        return metrics
+
+    def wandb_research_metadata(self) -> dict[str, object]:
+        """Return flat quality identity fields for the W&B run config."""
+
+        if self.quality_metadata is None:
+            return {}
+        return {
+            "quality_metadata_file": os.path.basename(self.quality_metadata.path),
+            "quality_metadata_sha256": self.quality_metadata.metadata_sha256,
+            "quality_config_sha256": self.quality_metadata.quality_config_sha256,
+            "quality_manifest_sha256": self.quality_metadata.manifest_sha256,
+            "quality_schema_version": self.quality_metadata.schema_version,
+            "quality_gate_scope": self.cfg.research.quality_gate.gate_scope,
+            "quality_include_borderline": self.cfg.research.quality_gate.include_borderline,
+            "quality_empty_motion_policy": self.cfg.research.quality_gate.empty_motion_policy,
+        }
 
     def sampling_state_dict(self) -> dict[str, object]:
         """Return segment layout and assignment counters for a training checkpoint."""
 
-        return {
+        state = {
             "version": SAMPLING_STATE_VERSION,
             "research_config": self.research_config_dict(),
             "segment_index": self.segment_index.state_dict() if self.segment_index is not None else None,
             "statistics": self.sampling_statistics.state_dict() if self.sampling_statistics is not None else None,
         }
+        if self.quality_metadata is not None:
+            state["quality_gate"] = self.quality_metadata.identity_state()
+            if self.quality_gate_index is not None:
+                state["quality_gate"].update(self.quality_gate_index.identity_state())
+            state["quality_exposure"] = self._quality_exposure_state_dict()
+        return state
+
+    def _quality_exposure_state_dict(self) -> dict[str, object]:
+        return {
+            "version": SAMPLING_STATE_VERSION,
+            "reference_frame_count": self.quality_reference_frame_count.detach().clone(),
+            "reject_reference_frame_count": self.quality_reject_reference_frame_count.detach().clone(),
+        }
+
+    def _load_quality_exposure_state_dict(self, state: Mapping[str, object] | None) -> None:
+        if state is None:
+            self.quality_reference_frame_count.zero_()
+            self.quality_reject_reference_frame_count.zero_()
+            return
+        if int(state.get("version", -1)) != SAMPLING_STATE_VERSION:
+            raise ValueError(
+                f"Unsupported quality exposure state version {state.get('version')}; "
+                f"expected {SAMPLING_STATE_VERSION}."
+            )
+        required = {"reference_frame_count", "reject_reference_frame_count"}
+        missing = required.difference(state)
+        if missing:
+            raise ValueError(f"Quality exposure state is missing fields: {sorted(missing)}")
+        reference_count = torch.as_tensor(
+            state.get("reference_frame_count"), dtype=torch.long, device=self.device
+        ).reshape(())
+        reject_reference_count = torch.as_tensor(
+            state.get("reject_reference_frame_count"), dtype=torch.long, device=self.device
+        ).reshape(())
+        if reference_count.item() < 0 or reject_reference_count.item() < 0:
+            raise ValueError("Checkpoint quality exposure counters must be non-negative.")
+        if reject_reference_count.item() > reference_count.item():
+            raise ValueError("Checkpoint reject_reference_frame_count cannot exceed reference_frame_count.")
+        self.quality_reference_frame_count.copy_(reference_count)
+        self.quality_reject_reference_frame_count.copy_(reject_reference_count)
 
     def load_sampling_state_dict(self, state: Mapping[str, object]) -> None:
         """Restore stage-0 statistics after validating the current motion pool."""
@@ -710,7 +1091,6 @@ class MotionCommand(CommandTerm):
         semantic_keys = (
             "method_name",
             "segment",
-            "quality_gate",
             "difficulty_calibration",
             "motion_sampling",
             "segment_sampling",
@@ -720,6 +1100,24 @@ class MotionCommand(CommandTerm):
         for key in semantic_keys:
             if saved_config.get(key) != current_config[key]:
                 raise ValueError(f"Checkpoint research config field '{key}' does not match the current configuration.")
+        saved_quality_config = saved_config.get("quality_gate")
+        current_quality_config = current_config["quality_gate"]
+        if not isinstance(saved_quality_config, Mapping) or not isinstance(current_quality_config, Mapping):
+            raise ValueError("Checkpoint quality_gate configuration is invalid.")
+        saved_quality_semantics = {
+            key: value
+            for key, value in _canonical_quality_gate_config(saved_quality_config).items()
+            if key != "metadata_path"
+        }
+        current_quality_semantics = {
+            key: value
+            for key, value in _canonical_quality_gate_config(current_quality_config).items()
+            if key != "metadata_path"
+        }
+        if saved_quality_semantics != current_quality_semantics:
+            raise ValueError(
+                "Checkpoint research config field 'quality_gate' does not match the current configuration."
+            )
         saved_statistics_config = saved_config.get("sampling_statistics")
         current_statistics_config = current_config["sampling_statistics"]
         if not isinstance(current_statistics_config, Mapping):
@@ -745,9 +1143,43 @@ class MotionCommand(CommandTerm):
                 raise ValueError("Checkpoint sampling statistics state is invalid.")
             self.sampling_statistics.load_state_dict(saved_statistics)
 
+        saved_quality_state = state.get("quality_gate")
+        if self.quality_metadata is None:
+            if saved_quality_state is not None:
+                raise ValueError("Checkpoint enables a quality gate but the current configuration does not.")
+        else:
+            if not isinstance(saved_quality_state, Mapping):
+                raise ValueError("Quality-gated resume requires checkpoint quality metadata identity state.")
+            current_identity = self.quality_metadata.identity_state()
+            if self.quality_gate_index is not None:
+                current_identity.update(self.quality_gate_index.identity_state())
+            for key in (
+                "schema_version",
+                "segment_schema_version",
+                "metadata_sha256",
+                "quality_config_sha256",
+                "manifest_sha256",
+                "pool_fingerprint",
+                "empty_motion_policy",
+                "manifest_motion_count",
+                "effective_motion_count",
+                "excluded_motion_count",
+                "eligible_motion_mask_sha256",
+            ):
+                if saved_quality_state.get(key) != current_identity[key]:
+                    raise ValueError(f"Checkpoint quality metadata field '{key}' does not match the current run.")
+            saved_exposure_state = state.get("quality_exposure")
+            if saved_exposure_state is not None and not isinstance(saved_exposure_state, Mapping):
+                raise ValueError("Checkpoint quality_exposure state is invalid.")
+            self._load_quality_exposure_state_dict(saved_exposure_state)
+
     def reset_sampling_statistics(self) -> None:
         if self.sampling_statistics is not None:
             self.sampling_statistics.reset_statistics()
+        if self.assignment_trace is not None:
+            self.assignment_trace.reset()
+        self.quality_reference_frame_count.zero_()
+        self.quality_reject_reference_frame_count.zero_()
 
     def record_current_sampling_assignments(self) -> None:
         """Count the active assignments created while a resume environment was initialized."""
@@ -821,6 +1253,19 @@ class ResearchFeatureToggleCfg:
 
 
 @configclass
+class QualityGateCfg:
+    """Frozen offline quality metadata and M1 start-frame gating settings."""
+
+    enabled: bool = False
+    metadata_path: str = ""
+    reject_statuses: tuple[str, ...] = ("reject",)
+    include_borderline: bool = True
+    strict_metadata_match: bool = True
+    empty_motion_policy: str = "error"
+    gate_scope: str = "assignment_start"
+
+
+@configclass
 class SamplingModeCfg:
     """Sampling mode selection; stage 0 implements only the legacy path."""
 
@@ -836,6 +1281,15 @@ class SamplingStatisticsCfg:
 
 
 @configclass
+class AssignmentTraceCfg:
+    """Optional bounded CSV trace for RNG-equivalence smoke tests."""
+
+    enabled: bool = False
+    output_path: str = ""
+    max_entries: int = 2048
+
+
+@configclass
 class ProbabilityValidationCfg:
     """Numerical tolerance for future adaptive sampling probabilities."""
 
@@ -848,12 +1302,13 @@ class ResearchExperimentCfg:
 
     method_name: str = "M0"
     segment: SegmentInfrastructureCfg = SegmentInfrastructureCfg()
-    quality_gate: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
+    quality_gate: QualityGateCfg = QualityGateCfg()
     difficulty_calibration: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
     motion_sampling: SamplingModeCfg = SamplingModeCfg()
     segment_sampling: SamplingModeCfg = SamplingModeCfg()
     diversity_constraint: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
     sampling_statistics: SamplingStatisticsCfg = SamplingStatisticsCfg()
+    assignment_trace: AssignmentTraceCfg = AssignmentTraceCfg()
     probability_validation: ProbabilityValidationCfg = ProbabilityValidationCfg()
 
 
