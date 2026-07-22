@@ -190,6 +190,11 @@ def _restore_sampling_state(runner: OnPolicyRunner, infos, checkpoint_path: str)
     if command is None:
         return
     if not isinstance(infos, Mapping) or SAMPLING_STATE_INFO_KEY not in infos:
+        if command.cfg.research.difficulty_calibration.enabled:
+            raise ValueError(
+                "Difficulty-enabled resume requires checkpoint sampling state with "
+                "difficulty metadata identity."
+            )
         warnings.warn(
             f"Checkpoint '{checkpoint_path}' has no sampling state; initializing statistics from the active "
             "environment assignments.",
@@ -273,29 +278,38 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         return infos
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
-        """Log normal RSL-RL values plus rate-limited sampling/quality summaries."""
+        """Log normal RSL-RL values plus rate-limited research summaries."""
 
         _sync_wandb_metadata(self)
         super().log(locs, width=width, pad=pad)
         command = _motion_command(self)
-        if command is None or not command.cfg.research.sampling_statistics.enabled:
+        if command is None:
+            return
+        statistics_enabled = bool(command.cfg.research.sampling_statistics.enabled)
+        difficulty_enabled = bool(command.cfg.research.difficulty_calibration.enabled)
+        if not statistics_enabled and not difficulty_enabled:
             return
         iteration = int(locs["it"])
         interval = int(command.cfg.research.sampling_statistics.log_interval)
         if iteration % interval != 0:
             return
-        metrics = command.sampling_metrics()
-        if metrics is None:
-            return
-        for name, value in metrics.items():
-            self.writer.add_scalar(f"sampling/{name}", value, iteration)
-        if hasattr(command, "quality_metrics"):
-            quality_metrics = command.quality_metrics()
-            if quality_metrics is not None:
-                for name, value in quality_metrics.items():
-                    self.writer.add_scalar(f"quality/{name}", value, iteration)
-        if hasattr(command, "dataset_metrics"):
-            dataset_metrics = command.dataset_metrics()
-            if dataset_metrics is not None:
-                for name, value in dataset_metrics.items():
-                    self.writer.add_scalar(f"dataset/{name}", value, iteration)
+        if statistics_enabled:
+            metrics = command.sampling_metrics()
+            if metrics is not None:
+                for name, value in metrics.items():
+                    self.writer.add_scalar(f"sampling/{name}", value, iteration)
+            if hasattr(command, "quality_metrics"):
+                quality_metrics = command.quality_metrics()
+                if quality_metrics is not None:
+                    for name, value in quality_metrics.items():
+                        self.writer.add_scalar(f"quality/{name}", value, iteration)
+            if hasattr(command, "dataset_metrics"):
+                dataset_metrics = command.dataset_metrics()
+                if dataset_metrics is not None:
+                    for name, value in dataset_metrics.items():
+                        self.writer.add_scalar(f"dataset/{name}", value, iteration)
+        if difficulty_enabled and hasattr(command, "difficulty_metrics"):
+            difficulty_metrics = command.difficulty_metrics()
+            if difficulty_metrics is not None:
+                for name, value in difficulty_metrics.items():
+                    self.writer.add_scalar(f"difficulty/{name}", value, iteration)

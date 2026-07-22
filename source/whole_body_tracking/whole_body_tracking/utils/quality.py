@@ -717,7 +717,14 @@ def _metric_result(
     return MetricResult(float(raw_value), severity, True, hard, dict(details or {}))
 
 
-def _normalize_quaternions(quaternions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def normalize_quaternions_wxyz(quaternions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return normalized WXYZ quaternions and their original norms.
+
+    Invalid or near-zero quaternions are represented by NaNs in the normalized
+    result.  This helper is shared by the quality and intrinsic-difficulty
+    pipelines so both interpret the converted G1 rotations identically.
+    """
+
     norms = np.linalg.norm(quaternions, axis=-1)
     valid = np.isfinite(norms) & (norms > 1.0e-12) & np.all(np.isfinite(quaternions), axis=-1)
     normalized = np.full_like(quaternions, np.nan, dtype=np.float64)
@@ -725,8 +732,10 @@ def _normalize_quaternions(quaternions: np.ndarray) -> tuple[np.ndarray, np.ndar
     return normalized, norms
 
 
-def _quaternion_geodesic_transitions(quaternions: np.ndarray) -> np.ndarray:
-    normalized, _ = _normalize_quaternions(quaternions)
+def quaternion_geodesic_transitions_wxyz(quaternions: np.ndarray) -> np.ndarray:
+    """Return frame-to-frame rotation angles with ``q`` and ``-q`` equivalent."""
+
+    normalized, _ = normalize_quaternions_wxyz(quaternions)
     output = np.full(quaternions.shape[:-1], np.nan, dtype=np.float64)
     if quaternions.shape[0] < 2:
         return output
@@ -737,12 +746,21 @@ def _quaternion_geodesic_transitions(quaternions: np.ndarray) -> np.ndarray:
     return output
 
 
-def _rotate_local_vectors_wxyz(quaternions: np.ndarray, vectors: np.ndarray) -> np.ndarray:
-    normalized, _ = _normalize_quaternions(quaternions)
+def rotate_local_vectors_wxyz(quaternions: np.ndarray, vectors: np.ndarray) -> np.ndarray:
+    """Rotate local XYZ vectors by WXYZ quaternions."""
+
+    normalized, _ = normalize_quaternions_wxyz(quaternions)
     vector = np.broadcast_to(vectors, normalized.shape[:-1] + (3,))
     xyz = normalized[..., 1:]
     twice_cross = 2.0 * np.cross(xyz, vector)
     return vector + normalized[..., :1] * twice_cross + np.cross(xyz, twice_cross)
+
+
+# Backward-compatible private aliases for the existing module-one audit.  New
+# consumers should use the public names above.
+_normalize_quaternions = normalize_quaternions_wxyz
+_quaternion_geodesic_transitions = quaternion_geodesic_transitions_wxyz
+_rotate_local_vectors_wxyz = rotate_local_vectors_wxyz
 
 
 def _isolated_spike_score(
