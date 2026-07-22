@@ -25,6 +25,8 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from whole_body_tracking.utils.difficulty import DEFAULT_ALGORITHM_SCHEMA_VERSION
+from whole_body_tracking.utils.difficulty_metadata import SegmentDifficultyMetadata
 from whole_body_tracking.utils.quality_metadata import (
     QUALITY_STATUS_TO_CODE,
     SegmentQualityMetadata,
@@ -265,7 +267,7 @@ class MotionLoader:
 
 
 def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
-    """Validate the implemented M0/M1 combinations and reject future modules."""
+    """Validate the implemented M0/M1 combinations and load-only difficulty metadata."""
 
     if cfg.method_name not in {"M0", "M1"}:
         raise NotImplementedError(
@@ -275,8 +277,6 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         raise ValueError("method_name='M0' requires quality_gate.enabled=False.")
     if cfg.method_name == "M1" and not cfg.quality_gate.enabled:
         raise ValueError("method_name='M1' requires quality_gate.enabled=True.")
-    if cfg.difficulty_calibration.enabled:
-        raise NotImplementedError("difficulty_calibration.enabled=True is not implemented in module 1.")
     if cfg.diversity_constraint.enabled:
         raise NotImplementedError("diversity_constraint.enabled=True is not implemented in module 1.")
     if cfg.motion_sampling.mode != "uniform":
@@ -302,6 +302,15 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         raise ValueError("sampling_statistics.log_interval must be at least 1.")
     if not math.isfinite(cfg.probability_validation.epsilon) or cfg.probability_validation.epsilon <= 0.0:
         raise ValueError("probability_validation.epsilon must be finite and greater than zero.")
+    if cfg.difficulty_calibration.enabled:
+        if not cfg.segment.enabled:
+            raise ValueError("difficulty_calibration requires segment.enabled=True.")
+        if not cfg.difficulty_calibration.metadata_path:
+            raise ValueError(
+                "difficulty_calibration.metadata_path is required when difficulty calibration is enabled."
+            )
+        if cfg.difficulty_calibration.expected_num_bins < 2:
+            raise ValueError("difficulty_calibration.expected_num_bins must be at least 2.")
     if cfg.quality_gate.enabled:
         if not cfg.segment.enabled:
             raise ValueError("quality_gate requires segment.enabled=True.")
@@ -337,6 +346,14 @@ def _canonical_quality_gate_config(config: Mapping[str, object]) -> dict[str, ob
     if "empty_motion_policy" not in canonical and "fail_on_empty_motion" in canonical:
         canonical["empty_motion_policy"] = "error" if canonical["fail_on_empty_motion"] else "exclude"
     canonical.pop("fail_on_empty_motion", None)
+    return canonical
+
+
+def _canonical_difficulty_calibration_config(config: Mapping[str, object]) -> dict[str, object]:
+    """Normalize difficulty config semantics while allowing metadata relocation."""
+
+    canonical = dict(config)
+    canonical.pop("metadata_path", None)
     return canonical
 
 
@@ -376,6 +393,10 @@ class MotionCommand(CommandTerm):
         self.quality_metadata_match_ok = False
         self.quality_reference_frame_count = torch.zeros((), dtype=torch.long, device=self.device)
         self.quality_reject_reference_frame_count = torch.zeros((), dtype=torch.long, device=self.device)
+        self.difficulty_metadata: SegmentDifficultyMetadata | None = None
+        self.difficulty_scores: torch.Tensor | None = None
+        self.difficulty_bins: torch.Tensor | None = None
+        self.difficulty_metadata_match_ok = False
         if self.cfg.research.segment.enabled:
             self.segment_index = FixedLengthSegmentIndex(
                 self.motion.motion_lengths,
@@ -405,6 +426,8 @@ class MotionCommand(CommandTerm):
                 )
         if self.cfg.research.quality_gate.enabled:
             self._initialize_quality_gate()
+        if self.cfg.research.difficulty_calibration.enabled:
+            self._initialize_difficulty_calibration()
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.assigned_local_segment_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -506,6 +529,150 @@ class MotionCommand(CommandTerm):
             f"effective_motions={gate_summary['num_eligible_motions']})"
         )
 
+    def _initialize_difficulty_calibration(self) -> None:
+        """Load frozen difficulty labels without changing assignment sampling."""
+
+        if self.segment_index is None:
+            raise RuntimeError("Difficulty calibration initialization requires a segment index.")
+        if not self.cfg.motion_file.endswith(".txt") or not os.path.isfile(self.cfg.motion_file):
+            raise ValueError("Difficulty calibration requires a local .txt motion manifest.")
+
+        metadata = SegmentDifficultyMetadata.load(self.cfg.research.difficulty_calibration.metadata_path)
+        if metadata.algorithm_schema_version != DEFAULT_ALGORITHM_SCHEMA_VERSION:
+            raise ValueError(
+                f"Difficulty metadata algorithm schema {metadata.algorithm_schema_version!r} is unsupported; "
+                f"expected {DEFAULT_ALGORITHM_SCHEMA_VERSION!r}."
+            )
+        motion_lengths = np.asarray(
+            self.motion.motion_lengths.detach().cpu().tolist(), dtype=np.int64
+        )
+        motion_fps = np.asarray(
+            self.motion.motion_fps.detach().cpu().tolist(), dtype=np.float64
+        )
+        motion_segment_offsets = np.asarray(
+            self.segment_index.motion_segment_offsets.detach().cpu().tolist(), dtype=np.int64
+        )
+        segment_global_ids = np.arange(self.segment_index.num_segments, dtype=np.int64)
+        segment_motion_ids = np.asarray(
+            self.segment_index.segment_motion_ids.detach().cpu().tolist(), dtype=np.int64
+        )
+        segment_local_ids = np.asarray(
+            self.segment_index.segment_local_ids.detach().cpu().tolist(), dtype=np.int64
+        )
+        segment_start_frames = np.asarray(
+            self.segment_index.segment_start_frames.detach().cpu().tolist(), dtype=np.int64
+        )
+        segment_end_frames = np.asarray(
+            self.segment_index.segment_end_frames.detach().cpu().tolist(), dtype=np.int64
+        )
+        segment_duration_seconds = (
+            (
+                self.segment_index.segment_end_frames - self.segment_index.segment_start_frames
+            ).to(torch.float64)
+            / self.motion.motion_fps[self.segment_index.segment_motion_ids]
+        ).detach().cpu().numpy()
+
+        # Even an explicitly non-strict diagnostic run must preserve the exact
+        # row-to-segment mapping.  Non-strict mode may relax provenance hashes,
+        # but it must never expose scores under different global segment IDs.
+        layout_checks = (
+            ("motion count", metadata.num_motions == self.motion.num_motions),
+            ("global segment count", metadata.num_segments == self.segment_index.num_segments),
+            (
+                "motion keys/order",
+                np.array_equal(metadata.motion_keys, np.asarray(self.motion.motion_keys, dtype=str)),
+            ),
+            ("motion frame counts", np.array_equal(metadata.motion_lengths, motion_lengths)),
+            (
+                "motion FPS",
+                metadata.motion_fps.shape == motion_fps.shape
+                and np.allclose(metadata.motion_fps, motion_fps, rtol=0.0, atol=1.0e-12),
+            ),
+            (
+                "segment offsets",
+                np.array_equal(metadata.motion_segment_offsets, motion_segment_offsets),
+            ),
+            ("global segment IDs", np.array_equal(metadata.global_segment_id, segment_global_ids)),
+            ("segment motion IDs", np.array_equal(metadata.motion_id, segment_motion_ids)),
+            ("local segment IDs", np.array_equal(metadata.local_segment_id, segment_local_ids)),
+            ("segment start frames", np.array_equal(metadata.start_frame, segment_start_frames)),
+            ("segment end frames", np.array_equal(metadata.end_frame_exclusive, segment_end_frames)),
+            (
+                "segment durations",
+                metadata.duration_seconds.shape == segment_duration_seconds.shape
+                and np.allclose(
+                    metadata.duration_seconds,
+                    segment_duration_seconds,
+                    rtol=1.0e-7,
+                    atol=1.0e-9,
+                ),
+            ),
+            (
+                "segment length",
+                math.isclose(
+                    metadata.segment_length_seconds,
+                    self.segment_index.segment_length_seconds,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                ),
+            ),
+            ("segment schema version", metadata.segment_schema_version == SAMPLING_STATE_VERSION),
+        )
+        layout_mismatches = [label for label, matches in layout_checks if not matches]
+        if layout_mismatches:
+            raise ValueError(
+                "Difficulty metadata has an incompatible segment layout that cannot be relaxed by "
+                "strict_metadata_match=False: "
+                + ", ".join(layout_mismatches)
+                + "."
+            )
+
+        metadata_match_ok = metadata.validate_against(
+            manifest_path=self.cfg.motion_file,
+            motion_keys=self.motion.motion_keys,
+            motion_lengths=motion_lengths,
+            motion_fps=motion_fps,
+            motion_segment_offsets=motion_segment_offsets,
+            segment_start_frames=segment_start_frames,
+            segment_end_frames=segment_end_frames,
+            segment_length_seconds=self.segment_index.segment_length_seconds,
+            segment_schema_version=SAMPLING_STATE_VERSION,
+            pool_fingerprint=self.motion.pool_fingerprint,
+            segment_global_ids=segment_global_ids,
+            segment_motion_ids=segment_motion_ids,
+            segment_local_ids=segment_local_ids,
+            segment_duration_seconds=segment_duration_seconds,
+            expected_num_bins=self.cfg.research.difficulty_calibration.expected_num_bins,
+            strict=self.cfg.research.difficulty_calibration.strict_metadata_match,
+        )
+        if metadata.num_bins != self.cfg.research.difficulty_calibration.expected_num_bins:
+            raise ValueError(
+                f"Difficulty metadata contains {metadata.num_bins} bins, but "
+                "difficulty_calibration.expected_num_bins is "
+                f"{self.cfg.research.difficulty_calibration.expected_num_bins}."
+            )
+        if not metadata_match_ok:
+            warnings.warn(
+                "Difficulty metadata mismatch was explicitly allowed by strict_metadata_match=False; "
+                "do not use this run as a formal module-2 result.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        self.difficulty_metadata = metadata
+        self.difficulty_scores = torch.as_tensor(
+            metadata.difficulty_score, dtype=torch.float32, device=self.device
+        )
+        self.difficulty_bins = torch.as_tensor(
+            metadata.difficulty_bin, dtype=torch.long, device=self.device
+        )
+        self.difficulty_metadata_match_ok = metadata_match_ok
+        print(
+            f"[INFO]: Loaded difficulty metadata '{metadata.path}' "
+            f"(segments={self.segment_index.num_segments}, motions={self.motion.num_motions}, "
+            f"bins={metadata.num_bins}, sampling=uniform load-only)"
+        )
+
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
@@ -527,6 +694,40 @@ class MotionCommand(CommandTerm):
             return None
         _, global_ids = self.segment_index.motion_frame_to_segment(self.motion_ids, self.time_steps)
         return global_ids
+
+    @property
+    def current_difficulty_scores(self) -> torch.Tensor | None:
+        """Return difficulty scores for the currently referenced segments."""
+
+        current_ids = self.current_global_segment_ids
+        if self.difficulty_scores is None or current_ids is None:
+            return None
+        return self.difficulty_scores[current_ids]
+
+    @property
+    def current_difficulty_bins(self) -> torch.Tensor | None:
+        """Return difficulty bins for the currently referenced segments."""
+
+        current_ids = self.current_global_segment_ids
+        if self.difficulty_bins is None or current_ids is None:
+            return None
+        return self.difficulty_bins[current_ids]
+
+    @property
+    def assigned_difficulty_scores(self) -> torch.Tensor | None:
+        """Return difficulty scores for the latest assignment-start segments."""
+
+        if self.difficulty_scores is None:
+            return None
+        return self.difficulty_scores[self.assigned_global_segment_ids]
+
+    @property
+    def assigned_difficulty_bins(self) -> torch.Tensor | None:
+        """Return difficulty bins for the latest assignment-start segments."""
+
+        if self.difficulty_bins is None:
+            return None
+        return self.difficulty_bins[self.assigned_global_segment_ids]
 
     @property
     def joint_pos(self) -> torch.Tensor:
@@ -888,6 +1089,26 @@ class MotionCommand(CommandTerm):
                     "gate_scope": self.cfg.research.quality_gate.gate_scope,
                 }
             )
+        difficulty_config: dict[str, object] = {
+            "enabled": self.cfg.research.difficulty_calibration.enabled
+        }
+        if self.cfg.research.difficulty_calibration.enabled:
+            if self.difficulty_metadata is None:
+                raise RuntimeError("Enabled difficulty calibration has no loaded metadata.")
+            difficulty_config.update(
+                {
+                    "metadata_path": self.difficulty_metadata.path,
+                    "metadata_sha256": self.difficulty_metadata.metadata_sha256,
+                    "profile_sha256": self.difficulty_metadata.profile_sha256,
+                    "difficulty_config_sha256": self.difficulty_metadata.difficulty_config_sha256,
+                    "manifest_sha256": self.difficulty_metadata.manifest_sha256,
+                    "schema_version": self.difficulty_metadata.schema_version,
+                    "strict_metadata_match": self.cfg.research.difficulty_calibration.strict_metadata_match,
+                    "expected_num_bins": self.cfg.research.difficulty_calibration.expected_num_bins,
+                    "num_bins": self.difficulty_metadata.num_bins,
+                    "sampling_still_uniform": True,
+                }
+            )
         return {
             "method_name": self.cfg.research.method_name,
             "segment": {
@@ -895,7 +1116,7 @@ class MotionCommand(CommandTerm):
                 "length_seconds": self.cfg.research.segment.length_seconds,
             },
             "quality_gate": quality_gate_config,
-            "difficulty_calibration": {"enabled": self.cfg.research.difficulty_calibration.enabled},
+            "difficulty_calibration": difficulty_config,
             "motion_sampling": {"mode": self.cfg.research.motion_sampling.mode},
             "segment_sampling": {"mode": self.cfg.research.segment_sampling.mode},
             "diversity_constraint": {"enabled": self.cfg.research.diversity_constraint.enabled},
@@ -1010,21 +1231,52 @@ class MotionCommand(CommandTerm):
         )
         return metrics
 
-    def wandb_research_metadata(self) -> dict[str, object]:
-        """Return flat quality identity fields for the W&B run config."""
+    def difficulty_metrics(self) -> dict[str, float | int] | None:
+        """Return static difficulty summaries without affecting sampling."""
 
-        if self.quality_metadata is None:
-            return {}
-        return {
-            "quality_metadata_file": os.path.basename(self.quality_metadata.path),
-            "quality_metadata_sha256": self.quality_metadata.metadata_sha256,
-            "quality_config_sha256": self.quality_metadata.quality_config_sha256,
-            "quality_manifest_sha256": self.quality_metadata.manifest_sha256,
-            "quality_schema_version": self.quality_metadata.schema_version,
-            "quality_gate_scope": self.cfg.research.quality_gate.gate_scope,
-            "quality_include_borderline": self.cfg.research.quality_gate.include_borderline,
-            "quality_empty_motion_policy": self.cfg.research.quality_gate.empty_motion_policy,
-        }
+        if self.difficulty_metadata is None:
+            return None
+        metrics = dict(self.difficulty_metadata.difficulty_metrics())
+        metrics["enabled"] = 1
+        metrics["metadata_match_ok"] = int(self.difficulty_metadata_match_ok)
+        metrics["sampling_still_uniform"] = int(
+            self.cfg.research.motion_sampling.mode == "uniform"
+            and self.cfg.research.segment_sampling.mode == "uniform"
+        )
+        return metrics
+
+    def wandb_research_metadata(self) -> dict[str, object]:
+        """Return flat static-metadata identity fields for the W&B run config."""
+
+        metadata: dict[str, object] = {}
+        if self.quality_metadata is not None:
+            metadata.update(
+                {
+                    "quality_metadata_file": os.path.basename(self.quality_metadata.path),
+                    "quality_metadata_sha256": self.quality_metadata.metadata_sha256,
+                    "quality_config_sha256": self.quality_metadata.quality_config_sha256,
+                    "quality_manifest_sha256": self.quality_metadata.manifest_sha256,
+                    "quality_schema_version": self.quality_metadata.schema_version,
+                    "quality_gate_scope": self.cfg.research.quality_gate.gate_scope,
+                    "quality_include_borderline": self.cfg.research.quality_gate.include_borderline,
+                    "quality_empty_motion_policy": self.cfg.research.quality_gate.empty_motion_policy,
+                }
+            )
+        if self.difficulty_metadata is not None:
+            metadata.update(
+                {
+                    "difficulty_metadata_file": os.path.basename(self.difficulty_metadata.path),
+                    "difficulty_metadata_sha256": self.difficulty_metadata.metadata_sha256,
+                    "difficulty_profile_sha256": self.difficulty_metadata.profile_sha256,
+                    "difficulty_config_sha256": self.difficulty_metadata.difficulty_config_sha256,
+                    "difficulty_manifest_sha256": self.difficulty_metadata.manifest_sha256,
+                    "difficulty_schema_version": self.difficulty_metadata.schema_version,
+                    "difficulty_num_bins": self.difficulty_metadata.num_bins,
+                    "difficulty_metadata_match_ok": self.difficulty_metadata_match_ok,
+                    "difficulty_sampling_still_uniform": True,
+                }
+            )
+        return metadata
 
     def sampling_state_dict(self) -> dict[str, object]:
         """Return segment layout and assignment counters for a training checkpoint."""
@@ -1040,7 +1292,28 @@ class MotionCommand(CommandTerm):
             if self.quality_gate_index is not None:
                 state["quality_gate"].update(self.quality_gate_index.identity_state())
             state["quality_exposure"] = self._quality_exposure_state_dict()
+        if self.difficulty_metadata is not None:
+            state["difficulty_calibration"] = self._difficulty_identity_state()
         return state
+
+    def _difficulty_identity_state(self) -> dict[str, object]:
+        """Return the static difficulty identity persisted in checkpoints."""
+
+        if self.difficulty_metadata is None:
+            raise RuntimeError("Difficulty identity requested while difficulty calibration is disabled.")
+        identity = dict(self.difficulty_metadata.identity_state())
+        identity.update(
+            {
+                "metadata_path": self.difficulty_metadata.path,
+                "metadata_sha256": self.difficulty_metadata.metadata_sha256,
+                "profile_sha256": self.difficulty_metadata.profile_sha256,
+                "difficulty_config_sha256": self.difficulty_metadata.difficulty_config_sha256,
+                "manifest_sha256": self.difficulty_metadata.manifest_sha256,
+                "schema_version": self.difficulty_metadata.schema_version,
+                "num_bins": self.difficulty_metadata.num_bins,
+            }
+        )
+        return identity
 
     def _quality_exposure_state_dict(self) -> dict[str, object]:
         return {
@@ -1091,7 +1364,6 @@ class MotionCommand(CommandTerm):
         semantic_keys = (
             "method_name",
             "segment",
-            "difficulty_calibration",
             "motion_sampling",
             "segment_sampling",
             "diversity_constraint",
@@ -1117,6 +1389,18 @@ class MotionCommand(CommandTerm):
         if saved_quality_semantics != current_quality_semantics:
             raise ValueError(
                 "Checkpoint research config field 'quality_gate' does not match the current configuration."
+            )
+        saved_difficulty_config = saved_config.get("difficulty_calibration")
+        current_difficulty_config = current_config["difficulty_calibration"]
+        if not isinstance(saved_difficulty_config, Mapping) or not isinstance(
+            current_difficulty_config, Mapping
+        ):
+            raise ValueError("Checkpoint difficulty_calibration configuration is invalid.")
+        if _canonical_difficulty_calibration_config(
+            saved_difficulty_config
+        ) != _canonical_difficulty_calibration_config(current_difficulty_config):
+            raise ValueError(
+                "Checkpoint research config field 'difficulty_calibration' does not match the current configuration."
             )
         saved_statistics_config = saved_config.get("sampling_statistics")
         current_statistics_config = current_config["sampling_statistics"]
@@ -1172,6 +1456,33 @@ class MotionCommand(CommandTerm):
             if saved_exposure_state is not None and not isinstance(saved_exposure_state, Mapping):
                 raise ValueError("Checkpoint quality_exposure state is invalid.")
             self._load_quality_exposure_state_dict(saved_exposure_state)
+
+        saved_difficulty_state = state.get("difficulty_calibration")
+        if self.difficulty_metadata is None:
+            if saved_difficulty_state is not None:
+                raise ValueError(
+                    "Checkpoint enables difficulty calibration but the current configuration does not."
+                )
+        else:
+            if not isinstance(saved_difficulty_state, Mapping):
+                raise ValueError(
+                    "Difficulty-enabled resume requires checkpoint difficulty metadata identity state."
+                )
+            current_difficulty_identity = self._difficulty_identity_state()
+            saved_identity = {
+                key: value for key, value in saved_difficulty_state.items() if key != "metadata_path"
+            }
+            current_identity = {
+                key: value
+                for key, value in current_difficulty_identity.items()
+                if key != "metadata_path"
+            }
+            identity_keys = sorted(set(saved_identity) | set(current_identity))
+            for key in identity_keys:
+                if saved_identity.get(key) != current_identity.get(key):
+                    raise ValueError(
+                        f"Checkpoint difficulty metadata field '{key}' does not match the current run."
+                    )
 
     def reset_sampling_statistics(self) -> None:
         if self.sampling_statistics is not None:
@@ -1266,6 +1577,16 @@ class QualityGateCfg:
 
 
 @configclass
+class DifficultyCalibrationCfg:
+    """Frozen policy-independent difficulty metadata loaded without resampling."""
+
+    enabled: bool = False
+    metadata_path: str = ""
+    strict_metadata_match: bool = True
+    expected_num_bins: int = 10
+
+
+@configclass
 class SamplingModeCfg:
     """Sampling mode selection; stage 0 implements only the legacy path."""
 
@@ -1303,7 +1624,7 @@ class ResearchExperimentCfg:
     method_name: str = "M0"
     segment: SegmentInfrastructureCfg = SegmentInfrastructureCfg()
     quality_gate: QualityGateCfg = QualityGateCfg()
-    difficulty_calibration: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
+    difficulty_calibration: DifficultyCalibrationCfg = DifficultyCalibrationCfg()
     motion_sampling: SamplingModeCfg = SamplingModeCfg()
     segment_sampling: SamplingModeCfg = SamplingModeCfg()
     diversity_constraint: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
