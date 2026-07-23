@@ -372,6 +372,53 @@ cd /home/l/whole_body_tracking_new
 
 本节只提供启动模板，不表示已经运行。公共参数：
 
+也可以优先使用脚本生成和执行同一批命令：
+
+```bash
+python scripts/run_module3_gpu_pilots.py --dry-run --suite trace
+python scripts/run_module3_gpu_pilots.py --suite trace
+
+python scripts/run_module3_gpu_pilots.py --dry-run --suite smoke
+python scripts/run_module3_gpu_pilots.py --suite smoke
+
+python scripts/run_module3_gpu_pilots.py --dry-run --suite debug --methods m2,m3,m4,m5,m6
+python scripts/run_module3_gpu_pilots.py --suite debug --methods m2,m3,m4,m5,m6
+
+python scripts/run_module3_gpu_pilots.py --dry-run --suite resume --methods m5,m6
+python scripts/run_module3_gpu_pilots.py --suite resume --methods m5,m6
+```
+
+跑完后使用只读验证脚本检查 trace、M6 mask、checkpoint sidecar 和可选 W&B history：
+
+```bash
+python scripts/validate_module3_gpu_pilots.py \
+  --trace-left /tmp/module3_gpu_pilot_traces/module3_m0_trace_random100_seed42_trace20.csv \
+  --trace-right /tmp/module3_gpu_pilot_traces/module3_stats_random100_seed42_trace20.csv
+
+python scripts/validate_module3_gpu_pilots.py \
+  --explain-m6-quality \
+  --quality-metadata outputs/module1_quality_random6000_seed42_original_v1/segment_quality_metadata.npz \
+  --expect-total-segments 21575 \
+  --expect-effective-segments 21485 \
+  --expect-effective-motions 5998 \
+  --expect-quality-reject-segments 90
+
+python scripts/validate_module3_gpu_pilots.py \
+  --checkpoint logs/rsl_rl/g1_flat/<run_dir>/model_<iter>.pt
+```
+
+真实 random6000 metadata 的 M6 分解为：
+
+```text
+total_segments = 21575
+quality_reject_segments = 90
+segments_without_legal_assignment_start = 0
+effective_segments = 21485
+effective_motions = 5998
+empty_motions = 2
+segments_in_empty_motions = 5
+```
+
 ```bash
 cd /home/l/whole_body_tracking_new
 conda activate hybrid_robot
@@ -497,6 +544,7 @@ python scripts/rsl_rl/train.py "${COMMON_ARGS[@]}" \
   env.commands.motion.research.segment_sampling.mode=relative_learning_gap \
   env.commands.motion.research.quality_gate.enabled=true \
   env.commands.motion.research.quality_gate.metadata_path="$QUALITY" \
+  env.commands.motion.research.quality_gate.include_borderline=false \
   env.commands.motion.research.quality_gate.empty_motion_policy=exclude \
   env.commands.motion.research.quality_gate.strict_metadata_match=true \
   env.commands.motion.research.difficulty_calibration.enabled=true \
