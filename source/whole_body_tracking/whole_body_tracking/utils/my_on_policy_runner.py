@@ -190,10 +190,13 @@ def _restore_sampling_state(runner: OnPolicyRunner, infos, checkpoint_path: str)
     if command is None:
         return
     if not isinstance(infos, Mapping) or SAMPLING_STATE_INFO_KEY not in infos:
-        if command.cfg.research.difficulty_calibration.enabled:
+        if (
+            command.cfg.research.difficulty_calibration.enabled
+            or command.cfg.research.online_learning.enabled
+        ):
             raise ValueError(
-                "Difficulty-enabled resume requires checkpoint sampling state with "
-                "difficulty metadata identity."
+                "Difficulty-enabled resume requires checkpoint sampling state; online-learning resume has the "
+                "same requirement for metadata identity, shared statistics and adaptive RNG state."
             )
         warnings.warn(
             f"Checkpoint '{checkpoint_path}' has no sampling state; initializing statistics from the active "
@@ -211,7 +214,11 @@ def _restore_sampling_state(runner: OnPolicyRunner, infos, checkpoint_path: str)
     # RslRlVecEnvWrapper resets the environment before runner.load().  Those
     # active assignments are real work for the resumed process, so add them on
     # top of the restored cumulative counters after the overwrite.
-    command.record_current_sampling_assignments()
+    online = getattr(command, "online_learning", None)
+    if online is not None and getattr(online, "sampler", None) is not None:
+        command.reassign_after_online_resume()
+    else:
+        command.record_current_sampling_assignments()
 
 
 class MyOnPolicyRunner(OnPolicyRunner):
@@ -244,6 +251,16 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         self._wandb_metadata_synced = False
         self._wandb_step_guard_installed = False
         self._wandb_step_offset = 0
+        command = _motion_command(self)
+        if (
+            command is not None
+            and command.cfg.research.online_learning.enabled
+            and log_dir is None
+        ):
+            raise ValueError(
+                "Online learning requires a runner log_dir because the PPO-iteration boundary hook "
+                "is dispatched from MotionOnPolicyRunner.log()."
+            )
 
     def save(self, path: str, infos=None):
         """Save the model and training information."""
@@ -281,15 +298,18 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         """Log normal RSL-RL values plus rate-limited research summaries."""
 
         _sync_wandb_metadata(self)
-        super().log(locs, width=width, pad=pad)
         command = _motion_command(self)
+        iteration = int(locs["it"])
+        if command is not None and hasattr(command, "on_learning_iteration_end"):
+            command.on_learning_iteration_end(iteration)
+        super().log(locs, width=width, pad=pad)
         if command is None:
             return
         statistics_enabled = bool(command.cfg.research.sampling_statistics.enabled)
         difficulty_enabled = bool(command.cfg.research.difficulty_calibration.enabled)
-        if not statistics_enabled and not difficulty_enabled:
+        online_enabled = bool(command.cfg.research.online_learning.enabled)
+        if not statistics_enabled and not difficulty_enabled and not online_enabled:
             return
-        iteration = int(locs["it"])
         interval = int(command.cfg.research.sampling_statistics.log_interval)
         if iteration % interval != 0:
             return
@@ -313,3 +333,8 @@ class MotionOnPolicyRunner(OnPolicyRunner):
             if difficulty_metrics is not None:
                 for name, value in difficulty_metrics.items():
                     self.writer.add_scalar(f"difficulty/{name}", value, iteration)
+        if online_enabled and hasattr(command, "online_learning_metrics"):
+            online_metrics = command.online_learning_metrics()
+            if online_metrics is not None:
+                for name, value in online_metrics.items():
+                    self.writer.add_scalar(name, value, iteration)
