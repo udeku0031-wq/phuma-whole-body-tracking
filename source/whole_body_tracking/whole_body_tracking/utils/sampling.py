@@ -628,6 +628,13 @@ class AssignmentTraceRecorder:
         "pool_fingerprint",
         "run_label",
     )
+    DIVERSITY_HEADER = HEADER + (
+        "cluster_id",
+        "cluster_probability",
+        "motion_probability_conditional",
+        "motion_probability_global",
+        "segment_probability_conditional",
+    )
 
     def __init__(
         self,
@@ -636,6 +643,7 @@ class AssignmentTraceRecorder:
         *,
         pool_fingerprint: str | None = None,
         run_label: str = "",
+        include_diversity: bool = False,
     ) -> None:
         if not output_path:
             raise ValueError("Assignment trace output_path must not be empty.")
@@ -645,6 +653,7 @@ class AssignmentTraceRecorder:
         self.max_entries = int(max_entries)
         self.pool_fingerprint = pool_fingerprint or ""
         self.run_label = run_label
+        self.include_diversity = bool(include_diversity)
         self.recorded_entries = 0
         self.reset()
 
@@ -654,7 +663,7 @@ class AssignmentTraceRecorder:
             os.makedirs(directory, exist_ok=True)
         with open(self.output_path, "w", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream)
-            writer.writerow(self.HEADER)
+            writer.writerow(self.DIVERSITY_HEADER if self.include_diversity else self.HEADER)
         self.recorded_entries = 0
 
     def record_assignments(
@@ -664,6 +673,12 @@ class AssignmentTraceRecorder:
         start_frames: Sequence[int] | torch.Tensor,
         local_segment_ids: Sequence[int] | torch.Tensor,
         global_segment_ids: Sequence[int] | torch.Tensor,
+        *,
+        cluster_ids: Sequence[int] | torch.Tensor | None = None,
+        cluster_probabilities: Sequence[float] | torch.Tensor | None = None,
+        conditional_motion_probabilities: Sequence[float] | torch.Tensor | None = None,
+        global_motion_probabilities: Sequence[float] | torch.Tensor | None = None,
+        conditional_segment_probabilities: Sequence[float] | torch.Tensor | None = None,
     ) -> int:
         if self.recorded_entries >= self.max_entries:
             return 0
@@ -678,6 +693,26 @@ class AssignmentTraceRecorder:
         if num_items == 0:
             return 0
 
+        diversity_tensors: list[torch.Tensor] = []
+        if self.include_diversity:
+            diversity_values = (
+                cluster_ids,
+                cluster_probabilities,
+                conditional_motion_probabilities,
+                global_motion_probabilities,
+                conditional_segment_probabilities,
+            )
+            if any(values is None for values in diversity_values):
+                raise ValueError(
+                    "Diversity assignment traces require cluster and factorized probability fields."
+                )
+            diversity_tensors = [
+                torch.as_tensor(values).reshape(-1).detach().cpu()
+                for values in diversity_values
+            ]
+            if any(tensor.numel() != num_items for tensor in diversity_tensors):
+                raise ValueError("Diversity assignment trace tensors must match the assignment count.")
+
         num_to_write = min(num_items, self.max_entries - self.recorded_entries)
         rows = zip(
             range(self.recorded_entries, self.recorded_entries + num_to_write),
@@ -686,19 +721,27 @@ class AssignmentTraceRecorder:
         )
         with open(self.output_path, "a", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream)
-            for assignment_index, env_id, motion_id, start_frame, local_id, global_id in rows:
-                writer.writerow(
-                    (
-                        assignment_index,
-                        env_id,
-                        motion_id,
-                        start_frame,
-                        local_id,
-                        global_id,
-                        self.pool_fingerprint,
-                        self.run_label,
-                    )
+            for row_index, (
+                assignment_index,
+                env_id,
+                motion_id,
+                start_frame,
+                local_id,
+                global_id,
+            ) in enumerate(rows):
+                row = (
+                    assignment_index,
+                    env_id,
+                    motion_id,
+                    start_frame,
+                    local_id,
+                    global_id,
+                    self.pool_fingerprint,
+                    self.run_label,
                 )
+                if self.include_diversity:
+                    row += tuple(tensor[row_index].item() for tensor in diversity_tensors)
+                writer.writerow(row)
         self.recorded_entries += num_to_write
         return num_to_write
 
@@ -708,6 +751,7 @@ class AssignmentTraceRecorder:
             "max_entries": self.max_entries,
             "recorded_entries": self.recorded_entries,
             "pool_fingerprint": self.pool_fingerprint,
+            "include_diversity": int(self.include_diversity),
         }
 
 

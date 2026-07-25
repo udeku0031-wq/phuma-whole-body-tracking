@@ -193,10 +193,12 @@ def _restore_sampling_state(runner: OnPolicyRunner, infos, checkpoint_path: str)
         if (
             command.cfg.research.difficulty_calibration.enabled
             or command.cfg.research.online_learning.enabled
+            or command.cfg.research.diversity_constraint.enabled
         ):
             raise ValueError(
-                "Difficulty-enabled resume requires checkpoint sampling state; online-learning resume has the "
-                "same requirement for metadata identity, shared statistics and adaptive RNG state."
+                "Difficulty-enabled resume requires checkpoint sampling state; online-learning- or "
+                "diversity-enabled resume has the same requirement for metadata identity, shared "
+                "statistics, probabilities, counters, and RNG state."
             )
         warnings.warn(
             f"Checkpoint '{checkpoint_path}' has no sampling state; initializing statistics from the active "

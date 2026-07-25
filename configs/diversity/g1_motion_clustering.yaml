@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "algorithm_schema_version": "wbt.motion_clustering.numpy_kmeans.v1",
+  "provisional": true,
+  "provisional_notice": "Fit on the Train manifest only, freeze this profile, and never tune K or profile state on Validation or Test.",
+  "num_clusters": 8,
+  "random_seed": 42,
+  "feature_list": [
+    "root_linear_speed_p95",
+    "root_linear_acceleration_p95",
+    "root_angular_speed_p95",
+    "root_angular_acceleration_p95",
+    "joint_speed_p95",
+    "joint_acceleration_p95",
+    "joint_range_mean",
+    "joint_range_p90",
+    "body_height_range",
+    "body_height_std",
+    "hand_speed_p95",
+    "foot_swing_speed_p95",
+    "end_effector_speed_p95",
+    "single_support_ratio",
+    "double_support_ratio",
+    "flight_ratio",
+    "contact_switch_rate_per_second"
+  ],
+  "feature_aggregations": {
+    "root_linear_speed_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "root_linear_acceleration_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "root_angular_speed_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "root_angular_acceleration_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "joint_speed_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "joint_acceleration_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "joint_range_mean": [
+      "duration_weighted_mean"
+    ],
+    "joint_range_p90": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "body_height_range": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "body_height_std": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "hand_speed_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "foot_swing_speed_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "end_effector_speed_p95": [
+      "duration_weighted_mean",
+      "p90"
+    ],
+    "single_support_ratio": [
+      "duration_weighted_mean"
+    ],
+    "double_support_ratio": [
+      "duration_weighted_mean"
+    ],
+    "flight_ratio": [
+      "duration_weighted_mean"
+    ],
+    "contact_switch_rate_per_second": [
+      "duration_weighted_mean",
+      "p90"
+    ]
+  },
+  "feature_units": {
+    "root_linear_speed_p95": "m/s",
+    "root_linear_acceleration_p95": "m/s^2",
+    "root_angular_speed_p95": "rad/s",
+    "root_angular_acceleration_p95": "rad/s^2",
+    "joint_speed_p95": "rad/s",
+    "joint_acceleration_p95": "rad/s^2",
+    "joint_range_mean": "rad",
+    "joint_range_p90": "rad",
+    "body_height_range": "m",
+    "body_height_std": "m",
+    "hand_speed_p95": "m/s",
+    "foot_swing_speed_p95": "m/s",
+    "end_effector_speed_p95": "m/s",
+    "single_support_ratio": "frame_fraction",
+    "double_support_ratio": "frame_fraction",
+    "flight_ratio": "frame_fraction",
+    "contact_switch_rate_per_second": "1/s"
+  },
+  "required_features": [
+    "root_linear_speed_p95",
+    "root_linear_acceleration_p95",
+    "root_angular_speed_p95",
+    "root_angular_acceleration_p95",
+    "joint_speed_p95",
+    "joint_acceleration_p95",
+    "joint_range_mean",
+    "joint_range_p90",
+    "body_height_range",
+    "body_height_std"
+  ],
+  "optional_features": [
+    "hand_speed_p95",
+    "foot_swing_speed_p95",
+    "end_effector_speed_p95",
+    "single_support_ratio",
+    "double_support_ratio",
+    "flight_ratio",
+    "contact_switch_rate_per_second"
+  ],
+  "minimum_optional_feature_coverage": 0.75,
+  "robust_scale_epsilon": 1e-6,
+  "near_constant_scale_threshold": 1e-5,
+  "zero_mad_fallback_quantiles": [
+    0.05,
+    0.95
+  ],
+  "zero_mad_fallback_scale_divisor": 3.289707253902945,
+  "robust_clip": 5.0,
+  "use_pca": false,
+  "pca_components": null,
+  "explained_variance_target": null,
+  "kmeans_n_init": 20,
+  "kmeans_max_iterations": 300,
+  "kmeans_tolerance": 1e-6,
+  "canonicalize_labels": true,
+  "minimum_cluster_size_warning": 20,
+  "cluster_budget_mode": "sqrt_size_with_floor",
+  "minimum_budget_fraction_of_uniform": 0.5,
+  "cluster_size_exponent": 0.5
+}

@@ -25,6 +25,7 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
+from whole_body_tracking.utils.cluster_metadata import MotionClusterMetadata
 from whole_body_tracking.utils.difficulty import DEFAULT_ALGORITHM_SCHEMA_VERSION
 from whole_body_tracking.utils.difficulty_metadata import SegmentDifficultyMetadata
 from whole_body_tracking.utils.online_learning import OnlineLearningController
@@ -274,7 +275,7 @@ class MotionLoader:
 
 
 def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
-    """Validate the implemented M0--M6 and global-bin experiment contracts."""
+    """Validate the implemented M0--M7 and diagnostic experiment contracts."""
 
     method_modes = {
         "M0": ("uniform", "uniform"),
@@ -284,12 +285,14 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         "M4": ("raw_error", "raw_error"),
         "M5": ("learning_gap", "relative_learning_gap"),
         "M6": ("learning_gap", "relative_learning_gap"),
+        "M7": ("learning_gap", "relative_learning_gap"),
+        "DIVERSITY_ONLY": ("uniform", "uniform"),
         "GLOBAL_BIN_RAW_ERROR": ("uniform", "global_bin_raw_error"),
     }
     if cfg.method_name not in method_modes:
         raise NotImplementedError(
-            f"Research method '{cfg.method_name}' is not implemented; use M0--M6 or "
-            "GLOBAL_BIN_RAW_ERROR."
+            f"Research method '{cfg.method_name}' is not implemented; use M0--M7, "
+            "DIVERSITY_ONLY, or GLOBAL_BIN_RAW_ERROR."
         )
     known_motion_modes = {"uniform", "raw_error", "learning_gap"}
     known_segment_modes = {
@@ -313,25 +316,64 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
             f"method_name='{cfg.method_name}' requires motion/segment modes {expected_modes}, "
             f"got {actual_modes}."
         )
-    if cfg.method_name in {"M0", "M2", "M3", "M4", "M5"} and cfg.quality_gate.enabled:
+    if cfg.method_name in {"M0", "M2", "M3", "M4", "M5", "DIVERSITY_ONLY"} and cfg.quality_gate.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires quality_gate.enabled=False.")
-    if cfg.method_name in {"M1", "M6"} and not cfg.quality_gate.enabled:
+    if cfg.method_name in {"M1", "M6", "M7"} and not cfg.quality_gate.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires quality_gate.enabled=True.")
-    if cfg.method_name in {"M2", "M3", "M4", "GLOBAL_BIN_RAW_ERROR"} and cfg.difficulty_calibration.enabled:
+    if cfg.method_name in {
+        "M2",
+        "M3",
+        "M4",
+        "DIVERSITY_ONLY",
+        "GLOBAL_BIN_RAW_ERROR",
+    } and cfg.difficulty_calibration.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' must not use difficulty calibration.")
-    if cfg.method_name in {"M5", "M6"} and not cfg.difficulty_calibration.enabled:
+    if cfg.method_name in {"M5", "M6", "M7"} and not cfg.difficulty_calibration.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires difficulty calibration.")
-    if cfg.diversity_constraint.enabled:
-        raise NotImplementedError("diversity_constraint.enabled=True is reserved for module four.")
+    diversity_enabled = bool(cfg.diversity_constraint.enabled)
+    if cfg.method_name in {"M7", "DIVERSITY_ONLY"} and not diversity_enabled:
+        raise ValueError(f"method_name='{cfg.method_name}' requires diversity_constraint.enabled=True.")
+    if cfg.method_name not in {"M7", "DIVERSITY_ONLY"} and diversity_enabled:
+        raise ValueError("Cluster diversity is only valid for M7 or the DIVERSITY_ONLY diagnostic.")
+    if diversity_enabled:
+        diversity = cfg.diversity_constraint
+        if not cfg.segment.enabled:
+            raise ValueError("diversity_constraint requires segment.enabled=True.")
+        if not diversity.metadata_path:
+            raise ValueError("diversity_constraint.metadata_path is required when enabled.")
+        if int(diversity.expected_num_clusters) < 1:
+            raise ValueError("diversity_constraint.expected_num_clusters must be positive.")
+        if diversity.budget_mode != "sqrt_size_with_floor":
+            raise NotImplementedError(
+                "Only diversity_constraint.budget_mode='sqrt_size_with_floor' is implemented."
+            )
+        floor = float(diversity.minimum_budget_fraction_of_uniform)
+        exponent = float(diversity.cluster_size_exponent)
+        if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
+            raise ValueError(
+                "diversity_constraint.minimum_budget_fraction_of_uniform must be in [0, 1]."
+            )
+        if not math.isfinite(exponent) or exponent < 0.0:
+            raise ValueError(
+                "diversity_constraint.cluster_size_exponent must be finite and non-negative."
+            )
+        if diversity.count_aware_correction:
+            raise NotImplementedError(
+                "diversity_constraint.count_aware_correction is reserved for a later ablation."
+            )
+        if not diversity.diversity_during_warmup:
+            raise NotImplementedError(
+                "The v1 M7 implementation keeps the diversity target active during warmup."
+            )
     online_cfg = getattr(cfg, "online_learning", None)
     online_enabled = bool(getattr(online_cfg, "enabled", False))
     online_statistics_enabled = bool(getattr(online_cfg, "statistics_enabled", False))
-    adaptive_enabled = actual_modes != ("uniform", "uniform")
+    adaptive_enabled = actual_modes != ("uniform", "uniform") or diversity_enabled
     if adaptive_enabled and not online_enabled:
         raise ValueError("Adaptive sampling modes require online_learning.enabled=True.")
     if online_enabled and not online_statistics_enabled:
         raise ValueError("online_learning.enabled=True requires statistics_enabled=True.")
-    if cfg.method_name in {"M5", "M6"} and cfg.difficulty_calibration.expected_num_bins < 2:
+    if cfg.method_name in {"M5", "M6", "M7"} and cfg.difficulty_calibration.expected_num_bins < 2:
         raise ValueError("Learning-gap modes require at least two difficulty bins.")
     if not math.isfinite(cfg.segment.length_seconds) or cfg.segment.length_seconds <= 0.0:
         raise ValueError("segment.length_seconds must be finite and greater than zero.")
@@ -383,8 +425,8 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
                 "quality_gate.empty_motion_policy must be one of "
                 f"{sorted(QualityGatedStartIndex._EMPTY_MOTION_POLICIES)}."
             )
-        if cfg.method_name == "M6" and cfg.quality_gate.empty_motion_policy != "exclude":
-            raise ValueError("M6 requires quality_gate.empty_motion_policy='exclude'.")
+        if cfg.method_name in {"M6", "M7"} and cfg.quality_gate.empty_motion_policy != "exclude":
+            raise ValueError(f"{cfg.method_name} requires quality_gate.empty_motion_policy='exclude'.")
 
     if online_cfg is not None:
         if int(online_cfg.warmup_iterations) < 0:
@@ -504,6 +546,14 @@ def _canonical_difficulty_calibration_config(config: Mapping[str, object]) -> di
     return canonical
 
 
+def _canonical_diversity_config(config: Mapping[str, object]) -> dict[str, object]:
+    """Normalize diversity semantics while allowing metadata-file relocation."""
+
+    canonical = dict(config)
+    canonical.pop("metadata_path", None)
+    return canonical
+
+
 class MotionCommand(CommandTerm):
     cfg: MotionCommandCfg
 
@@ -544,6 +594,9 @@ class MotionCommand(CommandTerm):
         self.difficulty_scores: torch.Tensor | None = None
         self.difficulty_bins: torch.Tensor | None = None
         self.difficulty_metadata_match_ok = False
+        self.cluster_metadata: MotionClusterMetadata | None = None
+        self.motion_cluster_ids: torch.Tensor | None = None
+        self.cluster_metadata_match_ok = False
         self.online_learning: OnlineLearningController | None = None
         if self.cfg.research.segment.enabled:
             self.segment_index = FixedLengthSegmentIndex(
@@ -566,6 +619,7 @@ class MotionCommand(CommandTerm):
                     self.cfg.research.assignment_trace.max_entries,
                     pool_fingerprint=self.motion.pool_fingerprint,
                     run_label=self.cfg.research.method_name,
+                    include_diversity=self.cfg.research.diversity_constraint.enabled,
                 )
                 print(
                     "[INFO]: Assignment trace enabled; writing first "
@@ -576,6 +630,8 @@ class MotionCommand(CommandTerm):
             self._initialize_quality_gate()
         if self.cfg.research.difficulty_calibration.enabled:
             self._initialize_difficulty_calibration()
+        if self.cfg.research.diversity_constraint.enabled:
+            self._initialize_cluster_metadata()
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.assigned_local_segment_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -826,6 +882,86 @@ class MotionCommand(CommandTerm):
             f"bins={metadata.num_bins}, use=policy-independent calibration)"
         )
 
+    def _initialize_cluster_metadata(self) -> None:
+        """Load the frozen Motion-to-cluster mapping without fitting at runtime."""
+
+        if self.segment_index is None:
+            raise RuntimeError("Cluster metadata initialization requires a segment index.")
+        if not self.cfg.motion_file.endswith(".txt") or not os.path.isfile(self.cfg.motion_file):
+            raise ValueError("Diversity-constrained training requires a local .txt motion manifest.")
+
+        metadata = MotionClusterMetadata.load(
+            self.cfg.research.diversity_constraint.metadata_path
+        )
+        difficulty_metadata_sha256 = (
+            metadata.difficulty_metadata_sha256
+            if self.difficulty_metadata is None
+            else self.difficulty_metadata.metadata_sha256
+        )
+        difficulty_profile_sha256 = (
+            metadata.difficulty_profile_sha256
+            if self.difficulty_metadata is None
+            else self.difficulty_metadata.profile_sha256
+        )
+        metadata_match_ok = metadata.validate_against(
+            manifest_path=self.cfg.motion_file,
+            motion_keys=self.motion.motion_keys,
+            motion_lengths=self.motion.motion_lengths.detach().cpu().tolist(),
+            motion_fps=self.motion.motion_fps.detach().cpu().tolist(),
+            motion_segment_offsets=self.segment_index.motion_segment_offsets.detach().cpu().tolist(),
+            pool_fingerprint=self.motion.pool_fingerprint,
+            difficulty_metadata_sha256=difficulty_metadata_sha256,
+            difficulty_profile_sha256=difficulty_profile_sha256,
+            expected_num_clusters=self.cfg.research.diversity_constraint.expected_num_clusters,
+            strict=self.cfg.research.diversity_constraint.strict_metadata_match,
+        )
+        if not metadata_match_ok:
+            warnings.warn(
+                "Cluster metadata provenance mismatch was explicitly allowed by "
+                "strict_metadata_match=False; do not use this run as a formal M7 result.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if self.difficulty_metadata is not None:
+            for label, cluster_value, difficulty_value in (
+                (
+                    "manifest SHA256",
+                    metadata.manifest_sha256,
+                    self.difficulty_metadata.manifest_sha256,
+                ),
+                (
+                    "pool fingerprint",
+                    metadata.pool_fingerprint,
+                    self.difficulty_metadata.pool_fingerprint,
+                ),
+                (
+                    "difficulty metadata SHA256",
+                    metadata.difficulty_metadata_sha256,
+                    self.difficulty_metadata.metadata_sha256,
+                ),
+                (
+                    "difficulty profile SHA256",
+                    metadata.difficulty_profile_sha256,
+                    self.difficulty_metadata.profile_sha256,
+                ),
+            ):
+                if cluster_value != difficulty_value:
+                    raise ValueError(
+                        f"Cluster and difficulty metadata {label} do not match; "
+                        "M7 requires one frozen Stage-0 mapping and difficulty profile."
+                    )
+
+        self.cluster_metadata = metadata
+        self.motion_cluster_ids = torch.as_tensor(
+            metadata.cluster_id, dtype=torch.long, device=self.device
+        )
+        self.cluster_metadata_match_ok = metadata_match_ok
+        print(
+            f"[INFO]: Loaded motion-cluster metadata '{metadata.path}' "
+            f"(motions={metadata.num_motions}, clusters={metadata.num_clusters}, "
+            "fit inputs=policy-independent G1 trajectory features)"
+        )
+
     def _online_learning_settings(self) -> dict[str, object]:
         """Return JSON-compatible provisional module-three semantics."""
 
@@ -884,17 +1020,52 @@ class MotionCommand(CommandTerm):
             "fallback": adaptive.fallback,
         }
 
-    def _validate_quality_difficulty_identity(self) -> None:
-        """Fail fast if the two frozen metadata files do not share provenance."""
+    def _diversity_sampling_settings(self) -> dict[str, object]:
+        """Return immutable M7 cluster budget and metadata identities."""
 
-        if self.quality_metadata is None or self.difficulty_metadata is None:
-            return
-        for field in ("manifest_sha256", "pool_fingerprint", "segment_schema_version"):
-            if getattr(self.quality_metadata, field) != getattr(self.difficulty_metadata, field):
-                raise ValueError(
-                    f"Quality and difficulty metadata field '{field}' does not match; "
-                    "module three requires one exact Stage-0 Segment mapping."
-                )
+        if self.cluster_metadata is None or self.motion_cluster_ids is None:
+            raise RuntimeError("Enabled diversity constraint has no loaded cluster metadata.")
+        diversity = self.cfg.research.diversity_constraint
+        return {
+            "schema_version": self.cluster_metadata.schema_version,
+            "algorithm_schema_version": self.cluster_metadata.algorithm_schema_version,
+            "metadata_sha256": self.cluster_metadata.metadata_sha256,
+            "metadata_match_ok": self.cluster_metadata_match_ok,
+            "profile_sha256": self.cluster_metadata.cluster_profile_sha256,
+            "config_sha256": self.cluster_metadata.cluster_config_sha256,
+            "num_clusters": self.cluster_metadata.num_clusters,
+            "budget_mode": diversity.budget_mode,
+            "minimum_budget_fraction_of_uniform": (
+                diversity.minimum_budget_fraction_of_uniform
+            ),
+            "cluster_size_exponent": diversity.cluster_size_exponent,
+            "diversity_during_warmup": diversity.diversity_during_warmup,
+            "count_aware_correction": diversity.count_aware_correction,
+        }
+
+    def _validate_quality_difficulty_identity(self) -> None:
+        """Fail fast if frozen quality, difficulty and cluster identities diverge."""
+
+        if self.quality_metadata is not None and self.difficulty_metadata is not None:
+            for field in ("manifest_sha256", "pool_fingerprint", "segment_schema_version"):
+                if getattr(self.quality_metadata, field) != getattr(self.difficulty_metadata, field):
+                    raise ValueError(
+                        f"Quality and difficulty metadata field '{field}' does not match; "
+                        "online sampling requires one exact Stage-0 Segment mapping."
+                    )
+        if self.cluster_metadata is not None:
+            for label, frozen in (
+                ("quality", self.quality_metadata),
+                ("difficulty", self.difficulty_metadata),
+            ):
+                if frozen is None:
+                    continue
+                for field in ("manifest_sha256", "pool_fingerprint"):
+                    if getattr(self.cluster_metadata, field) != getattr(frozen, field):
+                        raise ValueError(
+                            f"Cluster and {label} metadata field '{field}' does not match; "
+                            "M7 requires one exact Stage-0 mapping."
+                        )
 
     def _initialize_online_learning(self) -> None:
         """Create one shared controller; uniform M0/M1 creates no adaptive RNG."""
@@ -932,6 +1103,12 @@ class MotionCommand(CommandTerm):
             segment_eligible_mask=segment_eligible_mask,
             difficulty_bins=self.difficulty_bins,
             device=self.device,
+            motion_cluster_ids=self.motion_cluster_ids,
+            diversity_settings=(
+                self._diversity_sampling_settings()
+                if self.cfg.research.diversity_constraint.enabled
+                else None
+            ),
         )
         print(
             "[INFO]: Initialized shared online Motion--Segment statistics "
@@ -1332,7 +1509,31 @@ class MotionCommand(CommandTerm):
                 global_ids,
             )
         if self.assignment_trace is not None:
-            self.assignment_trace.record_assignments(env_ids, motion_ids, start_frames, local_ids, global_ids)
+            diversity_fields: dict[str, torch.Tensor] = {}
+            if self.cfg.research.diversity_constraint.enabled:
+                if self.online_learning is None or self.online_learning.sampler is None:
+                    raise RuntimeError("M7 assignment tracing requires an initialized diversity sampler.")
+                sampler = self.online_learning.sampler
+                if not hasattr(sampler, "motion_cluster_ids"):
+                    raise RuntimeError("M7 assignment tracing received a non-diversity sampler.")
+                cluster_ids = sampler.motion_cluster_ids[motion_ids]
+                diversity_fields = {
+                    "cluster_ids": cluster_ids,
+                    "cluster_probabilities": sampler.cluster_probability[cluster_ids],
+                    "conditional_motion_probabilities": (
+                        sampler.motion_probability_conditional[motion_ids]
+                    ),
+                    "global_motion_probabilities": sampler.motion_probability[motion_ids],
+                    "conditional_segment_probabilities": sampler.segment_probability[global_ids],
+                }
+            self.assignment_trace.record_assignments(
+                env_ids,
+                motion_ids,
+                start_frames,
+                local_ids,
+                global_ids,
+                **diversity_fields,
+            )
 
     def _record_quality_reference_exposure(self) -> None:
         """Count current reference frames that lie inside reject segments.
@@ -1390,11 +1591,12 @@ class MotionCommand(CommandTerm):
         motion_mode = self.cfg.research.motion_sampling.mode
         segment_mode = self.cfg.research.segment_sampling.mode
         if motion_mode == "uniform" and segment_mode == "uniform":
-            if self.cfg.research.quality_gate.enabled:
-                self._quality_gated_uniform_sampling(env_ids)
-            else:
-                self._adaptive_sampling(env_ids)
-            return
+            if not self.cfg.research.diversity_constraint.enabled:
+                if self.cfg.research.quality_gate.enabled:
+                    self._quality_gated_uniform_sampling(env_ids)
+                else:
+                    self._adaptive_sampling(env_ids)
+                return
         if self.online_learning is None or self.online_learning.sampler is None:
             raise RuntimeError("Adaptive sampling requested before online-learning initialization.")
         motion_ids, _, start_frames = self.online_learning.sample(len(env_ids))
@@ -1538,6 +1740,33 @@ class MotionCommand(CommandTerm):
                     ),
                 }
             )
+        diversity_config: dict[str, object] = {
+            "enabled": self.cfg.research.diversity_constraint.enabled
+        }
+        if self.cfg.research.diversity_constraint.enabled:
+            if self.cluster_metadata is None:
+                raise RuntimeError("Enabled diversity constraint has no loaded metadata.")
+            diversity = self.cfg.research.diversity_constraint
+            diversity_config.update(
+                {
+                    "metadata_path": self.cluster_metadata.path,
+                    "metadata_sha256": self.cluster_metadata.metadata_sha256,
+                    "profile_sha256": self.cluster_metadata.cluster_profile_sha256,
+                    "config_sha256": self.cluster_metadata.cluster_config_sha256,
+                    "manifest_sha256": self.cluster_metadata.manifest_sha256,
+                    "schema_version": self.cluster_metadata.schema_version,
+                    "strict_metadata_match": diversity.strict_metadata_match,
+                    "expected_num_clusters": diversity.expected_num_clusters,
+                    "num_clusters": self.cluster_metadata.num_clusters,
+                    "budget_mode": diversity.budget_mode,
+                    "minimum_budget_fraction_of_uniform": (
+                        diversity.minimum_budget_fraction_of_uniform
+                    ),
+                    "cluster_size_exponent": diversity.cluster_size_exponent,
+                    "diversity_during_warmup": diversity.diversity_during_warmup,
+                    "count_aware_correction": diversity.count_aware_correction,
+                }
+            )
         return {
             "method_name": self.cfg.research.method_name,
             "segment": {
@@ -1552,7 +1781,7 @@ class MotionCommand(CommandTerm):
             },
             "motion_sampling": {"mode": self.cfg.research.motion_sampling.mode},
             "segment_sampling": {"mode": self.cfg.research.segment_sampling.mode},
-            "diversity_constraint": {"enabled": self.cfg.research.diversity_constraint.enabled},
+            "diversity_constraint": diversity_config,
             "sampling_statistics": {
                 "enabled": self.cfg.research.sampling_statistics.enabled,
                 "log_interval": self.cfg.research.sampling_statistics.log_interval,
@@ -1729,6 +1958,29 @@ class MotionCommand(CommandTerm):
                     ),
                 }
             )
+        if self.cluster_metadata is not None:
+            metadata.update(
+                {
+                    "cluster_metadata_file": os.path.basename(self.cluster_metadata.path),
+                    "cluster_metadata_sha256": self.cluster_metadata.metadata_sha256,
+                    "cluster_profile_sha256": self.cluster_metadata.cluster_profile_sha256,
+                    "cluster_config_sha256": self.cluster_metadata.cluster_config_sha256,
+                    "cluster_manifest_sha256": self.cluster_metadata.manifest_sha256,
+                    "cluster_schema_version": self.cluster_metadata.schema_version,
+                    "diversity_num_clusters": self.cluster_metadata.num_clusters,
+                    "diversity_metadata_match_ok": self.cluster_metadata_match_ok,
+                    "diversity_budget_mode": (
+                        self.cfg.research.diversity_constraint.budget_mode
+                    ),
+                    "diversity_minimum_budget_fraction_of_uniform": (
+                        self.cfg.research.diversity_constraint.minimum_budget_fraction_of_uniform
+                    ),
+                    "diversity_cluster_size_exponent": (
+                        self.cfg.research.diversity_constraint.cluster_size_exponent
+                    ),
+                    "diversity_cluster_uses_learning_gap": False,
+                }
+            )
         if self.online_learning is not None:
             metadata.update(
                 {
@@ -1763,6 +2015,8 @@ class MotionCommand(CommandTerm):
             state["quality_exposure"] = self._quality_exposure_state_dict()
         if self.difficulty_metadata is not None:
             state["difficulty_calibration"] = self._difficulty_identity_state()
+        if self.cluster_metadata is not None:
+            state["diversity_constraint"] = self._cluster_identity_state()
         if self.online_learning is not None:
             state["online_learning"] = self.online_learning.state_dict()
         return state
@@ -1782,6 +2036,23 @@ class MotionCommand(CommandTerm):
                 "manifest_sha256": self.difficulty_metadata.manifest_sha256,
                 "schema_version": self.difficulty_metadata.schema_version,
                 "num_bins": self.difficulty_metadata.num_bins,
+            }
+        )
+        return identity
+
+    def _cluster_identity_state(self) -> dict[str, object]:
+        """Return the immutable cluster identity persisted outside sampler state."""
+
+        if self.cluster_metadata is None or self.motion_cluster_ids is None:
+            raise RuntimeError("Cluster identity requested while diversity is disabled.")
+        identity = dict(self.cluster_metadata.identity_state())
+        identity.update(
+            {
+                "metadata_match_ok": self.cluster_metadata_match_ok,
+                "expected_num_clusters": (
+                    self.cfg.research.diversity_constraint.expected_num_clusters
+                ),
+                "motion_cluster_ids": self.motion_cluster_ids.detach().clone(),
             }
         )
         return identity
@@ -1837,7 +2108,6 @@ class MotionCommand(CommandTerm):
             "segment",
             "motion_sampling",
             "segment_sampling",
-            "diversity_constraint",
             "probability_validation",
         )
         for key in semantic_keys:
@@ -1872,6 +2142,19 @@ class MotionCommand(CommandTerm):
         ) != _canonical_difficulty_calibration_config(current_difficulty_config):
             raise ValueError(
                 "Checkpoint research config field 'difficulty_calibration' does not match the current configuration."
+            )
+        saved_diversity_config = saved_config.get("diversity_constraint")
+        current_diversity_config = current_config["diversity_constraint"]
+        if not isinstance(saved_diversity_config, Mapping) or not isinstance(
+            current_diversity_config, Mapping
+        ):
+            raise ValueError("Checkpoint diversity_constraint configuration is invalid.")
+        if _canonical_diversity_config(saved_diversity_config) != _canonical_diversity_config(
+            current_diversity_config
+        ):
+            raise ValueError(
+                "Checkpoint research config field 'diversity_constraint' does not match "
+                "the current configuration."
             )
         saved_statistics_config = saved_config.get("sampling_statistics")
         current_statistics_config = current_config["sampling_statistics"]
@@ -1986,6 +2269,42 @@ class MotionCommand(CommandTerm):
                 if saved_identity.get(key) != current_identity.get(key):
                     raise ValueError(
                         f"Checkpoint difficulty metadata field '{key}' does not match the current run."
+                    )
+
+        saved_cluster_state = state.get("diversity_constraint")
+        if self.cluster_metadata is None:
+            if saved_cluster_state is not None:
+                raise ValueError(
+                    "Checkpoint enables cluster diversity but the current configuration does not."
+                )
+        else:
+            if not isinstance(saved_cluster_state, Mapping):
+                raise ValueError(
+                    "Diversity-enabled resume requires cluster metadata identity state."
+                )
+            current_cluster_identity = self._cluster_identity_state()
+            saved_cluster_ids = torch.as_tensor(
+                saved_cluster_state.get("motion_cluster_ids"),
+                dtype=torch.long,
+                device=self.device,
+            )
+            if (
+                self.motion_cluster_ids is None
+                or saved_cluster_ids.shape != self.motion_cluster_ids.shape
+                or not torch.equal(saved_cluster_ids, self.motion_cluster_ids)
+            ):
+                raise ValueError(
+                    "Checkpoint motion-to-cluster mapping does not match the current metadata."
+                )
+            ignored_cluster_fields = {"metadata_path", "motion_cluster_ids"}
+            identity_keys = sorted(
+                (set(saved_cluster_state) | set(current_cluster_identity))
+                - ignored_cluster_fields
+            )
+            for key in identity_keys:
+                if saved_cluster_state.get(key) != current_cluster_identity.get(key):
+                    raise ValueError(
+                        f"Checkpoint cluster metadata field '{key}' does not match the current run."
                     )
 
         saved_online_state = state.get("online_learning")
@@ -2116,10 +2435,18 @@ class SegmentInfrastructureCfg:
 
 
 @configclass
-class ResearchFeatureToggleCfg:
-    """Common switch for research algorithms introduced after stage 0."""
+class DiversityConstraintCfg:
+    """Frozen motion-cluster metadata and diversity-budget settings."""
 
     enabled: bool = False
+    metadata_path: str = ""
+    strict_metadata_match: bool = True
+    expected_num_clusters: int = 8
+    budget_mode: str = "sqrt_size_with_floor"
+    minimum_budget_fraction_of_uniform: float = 0.5
+    cluster_size_exponent: float = 0.5
+    diversity_during_warmup: bool = True
+    count_aware_correction: bool = False
 
 
 @configclass
@@ -2272,7 +2599,7 @@ class ResearchExperimentCfg:
     online_snapshot: OnlineSnapshotCfg = OnlineSnapshotCfg()
     motion_sampling: SamplingModeCfg = SamplingModeCfg()
     segment_sampling: SamplingModeCfg = SamplingModeCfg()
-    diversity_constraint: ResearchFeatureToggleCfg = ResearchFeatureToggleCfg()
+    diversity_constraint: DiversityConstraintCfg = DiversityConstraintCfg()
     sampling_statistics: SamplingStatisticsCfg = SamplingStatisticsCfg()
     assignment_trace: AssignmentTraceCfg = AssignmentTraceCfg()
     probability_validation: ProbabilityValidationCfg = ProbabilityValidationCfg()

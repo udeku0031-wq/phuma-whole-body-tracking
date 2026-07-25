@@ -165,6 +165,16 @@ def _build_research_metadata(env_cfg) -> dict:
         "motion_sampling_mode": research.motion_sampling.mode,
         "segment_sampling_mode": research.segment_sampling.mode,
         "diversity_constraint_enabled": research.diversity_constraint.enabled,
+        "diversity_metadata_path": research.diversity_constraint.metadata_path or None,
+        "diversity_strict_metadata_match": research.diversity_constraint.strict_metadata_match,
+        "diversity_expected_num_clusters": research.diversity_constraint.expected_num_clusters,
+        "diversity_budget_mode": research.diversity_constraint.budget_mode,
+        "diversity_minimum_budget_fraction_of_uniform": (
+            research.diversity_constraint.minimum_budget_fraction_of_uniform
+        ),
+        "diversity_cluster_size_exponent": research.diversity_constraint.cluster_size_exponent,
+        "diversity_during_warmup": research.diversity_constraint.diversity_during_warmup,
+        "diversity_count_aware_correction": research.diversity_constraint.count_aware_correction,
         "sampling_statistics_enabled": research.sampling_statistics.enabled,
         "sampling_statistics_log_interval": research.sampling_statistics.log_interval,
         "assignment_trace_enabled": research.assignment_trace.enabled,
