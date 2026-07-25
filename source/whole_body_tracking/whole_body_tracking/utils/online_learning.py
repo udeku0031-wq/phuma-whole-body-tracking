@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from whole_body_tracking.utils.adaptive_sampling import HierarchicalAdaptiveSampler
+from whole_body_tracking.utils.diversity_sampling import DiversityConstrainedSampler
 from whole_body_tracking.utils.learning_gap import (
     BinCalibrationResult,
     GapResult,
@@ -56,6 +57,8 @@ class OnlineLearningController:
         segment_eligible_mask: torch.Tensor,
         difficulty_bins: torch.Tensor | None,
         device: str | torch.device,
+        motion_cluster_ids: torch.Tensor | None = None,
+        diversity_settings: Mapping[str, object] | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.num_envs = int(num_envs)
@@ -68,9 +71,22 @@ class OnlineLearningController:
         self.motion_mode = str(motion_mode)
         self.segment_mode = str(segment_mode)
         self.settings = dict(settings)
-        self.config_hash = canonical_config_hash(
-            {"motion_mode": self.motion_mode, "segment_mode": self.segment_mode, **self.settings}
+        config_identity: dict[str, object] = {
+            "motion_mode": self.motion_mode,
+            "segment_mode": self.segment_mode,
+            **self.settings,
+        }
+        self.diversity_settings = (
+            None if diversity_settings is None else dict(diversity_settings)
         )
+        if (motion_cluster_ids is None) != (self.diversity_settings is None):
+            raise ValueError(
+                "motion_cluster_ids and diversity_settings must be provided together."
+            )
+        self.diversity_enabled = self.diversity_settings is not None
+        if self.diversity_settings is not None:
+            config_identity["diversity_constraint"] = self.diversity_settings
+        self.config_hash = canonical_config_hash(config_identity)
         self.difficulty_bins = (
             None
             if difficulty_bins is None
@@ -86,9 +102,55 @@ class OnlineLearningController:
             device=self.device,
             config_hash=self.config_hash,
         )
-        adaptive = self.motion_mode != "uniform" or self.segment_mode != "uniform"
-        self.sampler: HierarchicalAdaptiveSampler | None = None
-        if adaptive:
+        adaptive = (
+            self.motion_mode != "uniform"
+            or self.segment_mode != "uniform"
+            or self.diversity_enabled
+        )
+        self.sampler: HierarchicalAdaptiveSampler | DiversityConstrainedSampler | None = None
+        if self.diversity_enabled:
+            assert self.diversity_settings is not None
+            assert motion_cluster_ids is not None
+            self.sampler = DiversityConstrainedSampler(
+                self.segment_motion_ids,
+                self.segment_start_frames,
+                self.segment_end_frames,
+                self.motion_lengths,
+                motion_cluster_ids=motion_cluster_ids,
+                motion_eligible_mask=motion_eligible_mask,
+                segment_eligible_mask=segment_eligible_mask,
+                motion_mode=self.motion_mode,
+                segment_mode=self.segment_mode,
+                warmup_iterations=int(self.settings["warmup_iterations"]),
+                probability_update_interval=int(self.settings["probability_update_interval"]),
+                uniform_mix=float(self.settings["uniform_mix"]),
+                temperature=float(self.settings["temperature"]),
+                under_sampling_weight=float(self.settings["under_sampling_weight"]),
+                motion_probability_cap=float(self.settings["motion_probability_cap"]),
+                segment_probability_cap=float(self.settings["segment_probability_cap"]),
+                score_clip=float(self.settings["score_clip"]),
+                sampler_seed=int(self.settings["sampler_seed"]),
+                config_hash=self.config_hash,
+                num_clusters=int(self.diversity_settings["num_clusters"]),
+                minimum_budget_fraction_of_uniform=float(
+                    self.diversity_settings["minimum_budget_fraction_of_uniform"]
+                ),
+                cluster_size_exponent=float(
+                    self.diversity_settings["cluster_size_exponent"]
+                ),
+                budget_mode=str(self.diversity_settings["budget_mode"]),
+                cluster_metadata_hash=str(
+                    self.diversity_settings["metadata_sha256"]
+                ),
+                cluster_profile_sha256=str(
+                    self.diversity_settings["profile_sha256"]
+                ),
+                cluster_schema_version=str(
+                    self.diversity_settings["schema_version"]
+                ),
+                device=self.device,
+            )
+        elif adaptive:
             self.sampler = HierarchicalAdaptiveSampler(
                 self.segment_motion_ids,
                 self.segment_start_frames,
@@ -552,7 +614,26 @@ class OnlineLearningController:
                 }
             )
         if self.sampler is not None:
-            metrics.update({f"sampling/{name}": value for name, value in self.sampler.metrics().items()})
+            sampler_metrics = self.sampler.metrics()
+            metrics.update(
+                {f"sampling/{name}": value for name, value in sampler_metrics.items()}
+            )
+            if self.diversity_enabled:
+                metrics.update(
+                    {f"diversity/{name}": value for name, value in sampler_metrics.items()}
+                )
+                assert self.diversity_settings is not None
+                metrics.update(
+                    {
+                        "diversity/enabled": 1,
+                        "diversity/metadata_match_ok": int(
+                            bool(self.diversity_settings["metadata_match_ok"])
+                        ),
+                        "diversity/num_clusters": int(
+                            self.diversity_settings["num_clusters"]
+                        ),
+                    }
+                )
             if self.difficulty_bins is not None:
                 if self.segment_mode == "global_bin_raw_error":
                     marginal = self.sampler.global_segment_probability
