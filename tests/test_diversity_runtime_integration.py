@@ -51,6 +51,26 @@ def _m7_config() -> SimpleNamespace:
     return cfg
 
 
+def _m7_raw_config() -> SimpleNamespace:
+    cfg = _config("M4")
+    cfg.method_name = "M7-Raw"
+    cfg.quality_gate.enabled = True
+    cfg.quality_gate.metadata_path = "quality.npz"
+    cfg.quality_gate.empty_motion_policy = "exclude"
+    cfg.diversity_constraint = SimpleNamespace(
+        enabled=True,
+        metadata_path="clusters.npz",
+        strict_metadata_match=True,
+        expected_num_clusters=8,
+        budget_mode="sqrt_size_with_floor",
+        minimum_budget_fraction_of_uniform=0.5,
+        cluster_size_exponent=0.5,
+        diversity_during_warmup=True,
+        count_aware_correction=False,
+    )
+    return cfg
+
+
 def _command_method(name: str) -> ast.FunctionDef:
     module = ast.parse(COMMANDS_PATH.read_text(encoding="utf-8"), filename=str(COMMANDS_PATH))
     command = next(
@@ -93,6 +113,30 @@ class DiversityConfigContractTest(unittest.TestCase):
         cfg = _m7_config()
         cfg.diversity_constraint.minimum_budget_fraction_of_uniform = 1.1
         with self.assertRaisesRegex(ValueError, "minimum_budget_fraction"):
+            validate(cfg)
+
+    def test_m7_raw_contract_keeps_quality_diversity_and_disables_gap(self) -> None:
+        validate = _validator()
+        cfg = _m7_raw_config()
+        validate(cfg)
+
+        cfg = _m7_raw_config()
+        cfg.difficulty_calibration.enabled = True
+        cfg.difficulty_calibration.metadata_path = "difficulty.npz"
+        with self.assertRaisesRegex(ValueError, "must not use difficulty"):
+            validate(cfg)
+
+        cfg = _m7_raw_config()
+        cfg.motion_sampling.mode = "learning_gap"
+        cfg.segment_sampling.mode = "relative_learning_gap"
+        cfg.difficulty_calibration.enabled = True
+        cfg.difficulty_calibration.metadata_path = "difficulty.npz"
+        with self.assertRaisesRegex(ValueError, "requires motion/segment modes"):
+            validate(cfg)
+
+        cfg = _m7_raw_config()
+        cfg.diversity_constraint.enabled = False
+        with self.assertRaisesRegex(ValueError, "requires diversity_constraint"):
             validate(cfg)
 
     def test_m0_through_m6_keep_diversity_disabled(self) -> None:

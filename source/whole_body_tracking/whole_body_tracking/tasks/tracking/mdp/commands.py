@@ -286,13 +286,14 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         "M5": ("learning_gap", "relative_learning_gap"),
         "M6": ("learning_gap", "relative_learning_gap"),
         "M7": ("learning_gap", "relative_learning_gap"),
+        "M7-Raw": ("raw_error", "raw_error"),
         "DIVERSITY_ONLY": ("uniform", "uniform"),
         "GLOBAL_BIN_RAW_ERROR": ("uniform", "global_bin_raw_error"),
     }
     if cfg.method_name not in method_modes:
         raise NotImplementedError(
             f"Research method '{cfg.method_name}' is not implemented; use M0--M7, "
-            "DIVERSITY_ONLY, or GLOBAL_BIN_RAW_ERROR."
+            "M7-Raw, DIVERSITY_ONLY, or GLOBAL_BIN_RAW_ERROR."
         )
     known_motion_modes = {"uniform", "raw_error", "learning_gap"}
     known_segment_modes = {
@@ -318,12 +319,13 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         )
     if cfg.method_name in {"M0", "M2", "M3", "M4", "M5", "DIVERSITY_ONLY"} and cfg.quality_gate.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires quality_gate.enabled=False.")
-    if cfg.method_name in {"M1", "M6", "M7"} and not cfg.quality_gate.enabled:
+    if cfg.method_name in {"M1", "M6", "M7", "M7-Raw"} and not cfg.quality_gate.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires quality_gate.enabled=True.")
     if cfg.method_name in {
         "M2",
         "M3",
         "M4",
+        "M7-Raw",
         "DIVERSITY_ONLY",
         "GLOBAL_BIN_RAW_ERROR",
     } and cfg.difficulty_calibration.enabled:
@@ -331,10 +333,10 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
     if cfg.method_name in {"M5", "M6", "M7"} and not cfg.difficulty_calibration.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires difficulty calibration.")
     diversity_enabled = bool(cfg.diversity_constraint.enabled)
-    if cfg.method_name in {"M7", "DIVERSITY_ONLY"} and not diversity_enabled:
+    if cfg.method_name in {"M7", "M7-Raw", "DIVERSITY_ONLY"} and not diversity_enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires diversity_constraint.enabled=True.")
-    if cfg.method_name not in {"M7", "DIVERSITY_ONLY"} and diversity_enabled:
-        raise ValueError("Cluster diversity is only valid for M7 or the DIVERSITY_ONLY diagnostic.")
+    if cfg.method_name not in {"M7", "M7-Raw", "DIVERSITY_ONLY"} and diversity_enabled:
+        raise ValueError("Cluster diversity is only valid for M7, M7-Raw, or the DIVERSITY_ONLY diagnostic.")
     if diversity_enabled:
         diversity = cfg.diversity_constraint
         if not cfg.segment.enabled:

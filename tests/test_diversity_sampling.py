@@ -279,6 +279,36 @@ class DiversityConstrainedSamplerTest(unittest.TestCase):
                 sampler.segment_probability[first],
             )
 
+    def test_raw_error_modes_control_only_conditional_layers(self) -> None:
+        sampler = self._sampler(
+            motion_mode="raw_error",
+            segment_mode="raw_error",
+        )
+        before = sampler.cluster_probability.clone()
+        raw_motion_score = torch.tensor([1.0, 0.0, 6.0, 0.0, 2.0, 0.0])
+        raw_segment_score = torch.tensor([4.0] * 6 + [0.0] * 6)
+        self.assertTrue(
+            self._update(
+                sampler,
+                motion_score=raw_motion_score,
+                segment_score=raw_segment_score,
+            )
+        )
+        self.assertTrue(torch.equal(before, sampler.cluster_probability))
+        # Motions 0 and 2 share cluster 3; raw error makes motion 2 larger.
+        self.assertGreater(
+            sampler.motion_probability_conditional[2],
+            sampler.motion_probability_conditional[0],
+        )
+        # Raw segment error makes each motion's first segment larger.
+        for motion_id in range(6):
+            first = motion_id
+            second = motion_id + 6
+            self.assertGreater(
+                sampler.segment_probability[first],
+                sampler.segment_probability[second],
+            )
+
     def test_small_cluster_cap_relaxes_per_cluster_only(self) -> None:
         clusters = torch.tensor([0, 1, 1, 1, 1, 1])
         sampler = self._sampler(
