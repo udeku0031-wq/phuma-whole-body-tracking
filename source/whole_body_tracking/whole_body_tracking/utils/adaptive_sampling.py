@@ -401,7 +401,7 @@ class HierarchicalAdaptiveSampler:
             )
         conditional_cap = (
             self.segment_probability_cap
-            if self.segment_mode in {"raw_error", "relative_learning_gap"}
+            if self.segment_mode in {"raw_error", "raw_error_joint_gap", "relative_learning_gap"}
             else 1.0
         )
         self.segment_probability, self.nonempty_motion_mask, _ = grouped_probability(
@@ -625,6 +625,7 @@ class HierarchicalAdaptiveSampler:
                 ("raw_error", "uniform"): 2,
                 ("uniform", "raw_error"): 3,
                 ("raw_error", "raw_error"): 4,
+                ("raw_error", "raw_error_joint_gap"): 8,
                 ("learning_gap", "relative_learning_gap"): 5,
                 ("uniform", "global_bin_raw_error"): 7,
             }.get((self.motion_mode, self.segment_mode), -1),
@@ -700,7 +701,7 @@ class HierarchicalAdaptiveSampler:
         eligible_per_motion.scatter_add_(
             0, self.segment_motion_ids, self.segment_eligible_mask.to(torch.long)
         )
-        if self.segment_mode in {"raw_error", "relative_learning_gap"}:
+        if self.segment_mode in {"raw_error", "raw_error_joint_gap", "relative_learning_gap"}:
             infeasible_segment_cap = (eligible_per_motion > 0) & (
                 eligible_per_motion.to(torch.float64) * self.segment_probability_cap
                 < 1.0 - 1.0e-12

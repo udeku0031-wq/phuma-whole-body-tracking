@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -22,6 +23,14 @@ from whole_body_tracking.utils.learning_gap import (
     estimate_difficulty_bin_expectation,
     finite_distribution_summary,
 )
+from whole_body_tracking.utils.joint_gap import (
+    JOINT_GAP_SCHEMA_VERSION,
+    JointBinCalibrationResult,
+    JointGapCorrectionResult,
+    compute_joint_bin_statistics,
+    compute_joint_gap_correction,
+    finite_joint_gap_summary,
+)
 from whole_body_tracking.utils.online_learning_stats import (
     OnlineLearningStatistics,
     motion_episode_outcomes,
@@ -37,6 +46,14 @@ def canonical_config_hash(config: Mapping[str, object]) -> str:
 
     payload = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def canonical_joint_mapping_hash(joint_names: Sequence[str]) -> str:
+    """Hash the exact joint order used by per-joint tracking diagnostics."""
+
+    payload = [str(name) for name in joint_names]
+    encoded = json.dumps(payload, sort_keys=False, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class OnlineLearningController:
@@ -71,6 +88,23 @@ class OnlineLearningController:
         self.motion_mode = str(motion_mode)
         self.segment_mode = str(segment_mode)
         self.settings = dict(settings)
+        self.generic_gap_enabled = (
+            self.motion_mode == "learning_gap"
+            or self.segment_mode == "relative_learning_gap"
+        )
+        joint_gap_settings = self.settings.get("joint_gap", {})
+        if not isinstance(joint_gap_settings, Mapping):
+            raise TypeError("settings['joint_gap'] must be a mapping when provided.")
+        self.joint_gap_settings = dict(joint_gap_settings)
+        self.joint_gap_enabled = bool(self.joint_gap_settings.get("enabled", False))
+        if self.segment_mode == "raw_error_joint_gap" and not self.joint_gap_enabled:
+            raise ValueError("segment_mode='raw_error_joint_gap' requires joint_gap.enabled=True.")
+        if self.joint_gap_enabled:
+            if self.motion_mode != "raw_error" or self.segment_mode != "raw_error_joint_gap":
+                raise ValueError("Joint Gap is only valid for Motion Raw + Segment raw_error_joint_gap.")
+            if difficulty_bins is None:
+                raise ValueError("Joint Gap requires difficulty metadata for per-bin calibration.")
+            self._validate_joint_gap_settings()
         config_identity: dict[str, object] = {
             "motion_mode": self.motion_mode,
             "segment_mode": self.segment_mode,
@@ -101,6 +135,17 @@ class OnlineLearningController:
             ema_decay=float(self.settings["ema_decay"]),
             device=self.device,
             config_hash=self.config_hash,
+            joint_gap_num_joints=(
+                int(self.joint_gap_settings["num_joints"]) if self.joint_gap_enabled else None
+            ),
+            joint_gap_joint_names=(
+                tuple(str(name) for name in self.joint_gap_settings.get("joint_names", ()))
+                if self.joint_gap_enabled
+                else ()
+            ),
+            joint_gap_mapping_hash=(
+                str(self.joint_gap_settings["joint_mapping_hash"]) if self.joint_gap_enabled else ""
+            ),
         )
         adaptive = (
             self.motion_mode != "uniform"
@@ -180,6 +225,8 @@ class OnlineLearningController:
         self.motion_error_result: MotionErrorResult | None = None
         self.bin_calibration: BinCalibrationResult | None = None
         self.gap_result: GapResult | None = None
+        self.joint_bin_calibration: JointBinCalibrationResult | None = None
+        self.joint_gap_result: JointGapCorrectionResult | None = None
 
         self.active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.episode_motion_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -191,6 +238,45 @@ class OnlineLearningController:
         self.traversal_required_frames = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
         self.traversal_full_frames = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
         self.traversal_observed_frames = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+    def _validate_joint_gap_settings(self) -> None:
+        num_joints = int(self.joint_gap_settings.get("num_joints", 0))
+        num_bins = int(self.joint_gap_settings.get("num_difficulty_bins", 0))
+        top_k = int(self.joint_gap_settings.get("top_k", 0))
+        if num_joints < 1:
+            raise ValueError("joint_gap.num_joints must be positive.")
+        if num_bins < 2:
+            raise ValueError("joint_gap.num_difficulty_bins must be at least 2.")
+        if not 1 <= top_k <= num_joints:
+            raise ValueError("joint_gap.top_k must be in [1, num_joints].")
+        for name in ("lambda_joint", "ema_decay"):
+            value = float(self.joint_gap_settings.get(name, 0.0))
+            if not torch.isfinite(torch.tensor(value)).item() or value < 0.0:
+                raise ValueError(f"joint_gap.{name} must be finite and non-negative.")
+        if float(self.joint_gap_settings.get("ema_decay", 0.0)) >= 1.0:
+            raise ValueError("joint_gap.ema_decay must be in [0, 1).")
+        for name in ("update_interval", "min_observations"):
+            if int(self.joint_gap_settings.get(name, 0)) < 1:
+                raise ValueError(f"joint_gap.{name} must be positive.")
+        if self.joint_gap_settings.get("positive_only", True) is not True:
+            raise NotImplementedError("M7-JGap freezes joint_gap.positive_only=True.")
+        if self.joint_gap_settings.get("local_center", "motion_median") != "motion_median":
+            raise NotImplementedError("M7-JGap freezes joint_gap.local_center='motion_median'.")
+        if self.joint_gap_settings.get("aggregation", "topk_mean") != "topk_mean":
+            raise NotImplementedError("M7-JGap freezes joint_gap.aggregation='topk_mean'.")
+        if self.joint_gap_settings.get("transform", "tanh") != "tanh":
+            raise NotImplementedError("M7-JGap freezes joint_gap.transform='tanh'.")
+        raw_gate = self.joint_gap_settings.get("raw_gate", {})
+        if not isinstance(raw_gate, Mapping):
+            raise TypeError("joint_gap.raw_gate must be a mapping.")
+        if raw_gate.get("enabled", True) is not True or raw_gate.get("mode", "within_motion_median") != "within_motion_median":
+            raise NotImplementedError("M7-JGap freezes raw_gate to within-motion median.")
+        joint_names = tuple(str(name) for name in self.joint_gap_settings.get("joint_names", ()))
+        if joint_names and len(joint_names) != num_joints:
+            raise ValueError("joint_gap.joint_names length must match joint_gap.num_joints.")
+        expected_hash = canonical_joint_mapping_hash(joint_names)
+        if str(self.joint_gap_settings.get("joint_mapping_hash", "")) != expected_hash:
+            raise ValueError("joint_gap.joint_mapping_hash does not match the configured joint order.")
 
     def _ids(self, env_ids: Sequence[int] | torch.Tensor) -> torch.Tensor:
         ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
@@ -260,6 +346,7 @@ class OnlineLearningController:
         body_error: torch.Tensor,
         joint_error: torch.Tensor,
         orientation_error: torch.Tensor,
+        per_joint_error: torch.Tensor | None = None,
         env_ids: Sequence[int] | torch.Tensor | None = None,
     ) -> None:
         """Record the pre-reset terminal/current frame for every active env."""
@@ -298,12 +385,28 @@ class OnlineLearningController:
                 f"{name} must contain either one value per environment or one per requested env_id."
             )
 
+        def active_component_matrix(name: str, value: torch.Tensor | None) -> torch.Tensor | None:
+            if value is None:
+                return None
+            tensor = torch.as_tensor(value, device=self.device)
+            full_shape = (self.num_envs, int(self.joint_gap_settings.get("num_joints", tensor.shape[-1])))
+            if tensor.shape == full_shape:
+                return tensor[active_ids]
+            if requested is not None and tensor.ndim == 2 and tensor.shape[0] == requested.numel():
+                if requested_active is None:
+                    raise RuntimeError("Requested online observation mask is unavailable.")
+                return tensor[requested_active]
+            raise ValueError(
+                f"{name} must contain either one row per environment or one row per requested env_id."
+            )
+
         self.statistics.record_step_observations(
             motion_ids[active_ids],
             segment_ids[active_ids],
             body_error=active_component("body_error", body_error),
             joint_error=active_component("joint_error", joint_error),
             orientation_error=active_component("orientation_error", orientation_error),
+            per_joint_error=active_component_matrix("per_joint_error", per_joint_error),
         )
         self.episode_observed_frames[active_ids] += 1
         self.traversal_observed_frames[active_ids] += 1
@@ -500,7 +603,12 @@ class OnlineLearningController:
             weights=motion_error_weights,
         )
 
-        if self.difficulty_bins is not None:
+        self.bin_calibration = None
+        self.gap_result = None
+        self.joint_bin_calibration = None
+        self.joint_gap_result = None
+
+        if self.difficulty_bins is not None and self.generic_gap_enabled:
             bin_weights = (
                 self.statistics.segment_step_count
                 if bool(self.settings["bin_observation_weighted"])
@@ -532,6 +640,8 @@ class OnlineLearningController:
                 gap_clip=float(self.settings["gap_clip"]),
                 motion_gap_weights=gap_weights,
             )
+        if self.joint_gap_enabled:
+            self._update_joint_gap_formula()
         self.last_formula_update_iteration = sampling_iteration
 
         if self.sampler is None:
@@ -549,6 +659,14 @@ class OnlineLearningController:
                 raise RuntimeError("relative_learning_gap sampling requires difficulty-calibrated gap state.")
             segment_score = self.gap_result.local_gap
             segment_valid = self.gap_result.global_valid
+        elif self.segment_mode == "raw_error_joint_gap":
+            if self.joint_gap_result is None:
+                raise RuntimeError("raw_error_joint_gap sampling requires joint-gap state.")
+            if float(self.joint_gap_settings["lambda_joint"]) == 0.0:
+                segment_score = self.segment_error_result.error
+            else:
+                segment_score = self.joint_gap_result.corrected_priority
+            segment_valid = self.segment_error_result.valid
         else:
             segment_score = self.segment_error_result.error
             segment_valid = self.segment_error_result.valid
@@ -560,6 +678,48 @@ class OnlineLearningController:
             segment_score_valid=segment_valid,
             motion_sample_count=self.statistics.motion_sample_count,
             segment_sample_count=self.statistics.segment_sample_count,
+        )
+
+    def _update_joint_gap_formula(self) -> None:
+        if self.difficulty_bins is None:
+            raise RuntimeError("Joint Gap requires difficulty bins.")
+        joint_stats = self.statistics.joint_gap
+        if joint_stats is None:
+            raise RuntimeError("Joint Gap is enabled without joint statistics state.")
+        if self.segment_error_result is None:
+            raise RuntimeError("Joint Gap requires the raw segment-error cache.")
+
+        min_observations = int(self.joint_gap_settings["min_observations"])
+        segment_joint_valid = (
+            joint_stats.segment_joint_error_initialized
+            & (self.statistics.segment_step_count >= min_observations)
+        )
+        bin_weights = (
+            self.statistics.segment_step_count
+            if bool(self.settings["bin_observation_weighted"])
+            else None
+        )
+        self.joint_bin_calibration = compute_joint_bin_statistics(
+            joint_stats.segment_joint_error_ema,
+            segment_joint_valid,
+            self.difficulty_bins,
+            num_bins=int(self.joint_gap_settings["num_difficulty_bins"]),
+            min_bin_valid_segments=int(self.settings["min_bin_valid_segments"]),
+            sigma_floor=float(self.settings["sigma_floor"]),
+            observation_weights=bin_weights,
+        )
+        self.joint_gap_result = compute_joint_gap_correction(
+            raw_priority=self.segment_error_result.error,
+            raw_valid=self.segment_error_result.valid,
+            segment_joint_error=joint_stats.segment_joint_error_ema,
+            segment_joint_valid=segment_joint_valid,
+            segment_motion_ids=self.segment_motion_ids,
+            difficulty_bin=self.difficulty_bins,
+            calibration=self.joint_bin_calibration,
+            num_motions=self.num_motions,
+            top_k=int(self.joint_gap_settings["top_k"]),
+            lambda_joint=float(self.joint_gap_settings["lambda_joint"]),
+            gap_clip=float(self.settings["gap_clip"]),
         )
 
     def metrics(self) -> dict[str, float | int]:
@@ -613,6 +773,8 @@ class OnlineLearningController:
                     / max(int(torch.count_nonzero(self.gap_result.global_valid).item()), 1),
                 }
             )
+        if self.joint_gap_enabled:
+            metrics.update(self._joint_gap_metrics())
         if self.sampler is not None:
             sampler_metrics = self.sampler.metrics()
             metrics.update(
@@ -648,6 +810,113 @@ class OnlineLearningController:
                     )
         return metrics
 
+    def _joint_gap_metrics(self) -> dict[str, float | int]:
+        metrics: dict[str, float | int] = {}
+        joint_stats = self.statistics.joint_gap
+        if joint_stats is None:
+            return metrics
+        initialized = joint_stats.segment_joint_error_initialized
+        if torch.any(initialized):
+            per_joint_mean = torch.where(
+                initialized[:, None],
+                joint_stats.segment_joint_error_ema,
+                torch.zeros_like(joint_stats.segment_joint_error_ema),
+            ).sum(dim=0) / torch.count_nonzero(initialized).clamp_min(1).to(torch.float32)
+        else:
+            per_joint_mean = torch.zeros(joint_stats.num_joints, dtype=torch.float32, device=self.device)
+        for joint_id in range(joint_stats.num_joints):
+            metrics[f"joint_gap/joint_{joint_id}_mean_error_ema"] = float(per_joint_mean[joint_id].item())
+            metrics[f"joint_gap/joint_{joint_id}_mean_positive_gap"] = 0.0
+            metrics[f"joint_gap/joint_{joint_id}_top6_selection_frequency"] = 0.0
+
+        if self.joint_bin_calibration is not None:
+            reliable_count = int(torch.count_nonzero(self.joint_bin_calibration.reliable_mask).item())
+            metrics["joint_gap/sigma_floor_fraction"] = (
+                float(torch.count_nonzero(self.joint_bin_calibration.sigma_floor_mask).item())
+                / max(reliable_count, 1)
+            )
+        else:
+            metrics["joint_gap/sigma_floor_fraction"] = 0.0
+
+        if self.joint_gap_result is None:
+            for name in ("gap", "correction"):
+                metrics[f"joint_gap/{name}_mean"] = 0.0
+                metrics[f"joint_gap/{name}_p90"] = 0.0
+                metrics[f"joint_gap/{name}_max"] = 0.0
+            metrics["joint_gap/active_segment_fraction"] = 0.0
+            metrics["joint_gap/raw_gate_pass_fraction"] = 0.0
+            metrics["joint_gap/segment_top1_mass"] = 0.0
+            metrics["joint_gap/segment_top5_mass"] = 0.0
+            metrics["joint_gap/effective_segment_count"] = 0.0
+            return metrics
+
+        result = self.joint_gap_result
+        gap_summary = finite_joint_gap_summary(result.segment_gap_score, result.segment_valid)
+        correction_summary = finite_joint_gap_summary(result.correction, result.segment_valid)
+        metrics.update(
+            {
+                "joint_gap/gap_mean": gap_summary["mean"],
+                "joint_gap/gap_p90": gap_summary["p90"],
+                "joint_gap/gap_max": gap_summary["max"],
+                "joint_gap/correction_mean": correction_summary["mean"],
+                "joint_gap/correction_p90": correction_summary["p90"],
+                "joint_gap/correction_max": correction_summary["max"],
+                "joint_gap/active_segment_fraction": (
+                    float(torch.count_nonzero(result.correction[result.segment_valid] > 0.0).item())
+                    / max(int(torch.count_nonzero(result.segment_valid).item()), 1)
+                ),
+                "joint_gap/raw_gate_pass_fraction": (
+                    float(torch.count_nonzero(result.raw_gate_mask[result.segment_valid]).item())
+                    / max(int(torch.count_nonzero(result.segment_valid).item()), 1)
+                ),
+            }
+        )
+        for joint_id in range(joint_stats.num_joints):
+            valid = result.local_valid[:, joint_id]
+            positive = result.local_gap[:, joint_id][valid & (result.local_gap[:, joint_id] > 0.0)]
+            metrics[f"joint_gap/joint_{joint_id}_mean_positive_gap"] = (
+                float(positive.mean().item()) if positive.numel() else 0.0
+            )
+            metrics[f"joint_gap/joint_{joint_id}_top6_selection_frequency"] = float(
+                result.topk_selection_frequency[joint_id].item()
+            )
+
+        metrics.update(self._joint_gap_segment_mass_metrics())
+        return metrics
+
+    def _joint_gap_segment_mass_metrics(self) -> dict[str, float | int]:
+        if self.sampler is None:
+            return {
+                "joint_gap/segment_top1_mass": 0.0,
+                "joint_gap/segment_top5_mass": 0.0,
+                "joint_gap/effective_segment_count": 0.0,
+            }
+        if self.segment_mode == "global_bin_raw_error":
+            marginal = self.sampler.global_segment_probability
+        else:
+            marginal = self.sampler.motion_probability[self.segment_motion_ids] * self.sampler.segment_probability
+        if hasattr(self.sampler, "segment_eligible_mask"):
+            eligible = self.sampler.segment_eligible_mask
+        else:
+            eligible = torch.ones_like(marginal, dtype=torch.bool)
+        selected = marginal[eligible & torch.isfinite(marginal) & (marginal > 0.0)]
+        if selected.numel() == 0:
+            return {
+                "joint_gap/segment_top1_mass": 0.0,
+                "joint_gap/segment_top5_mass": 0.0,
+                "joint_gap/effective_segment_count": 0.0,
+            }
+        selected = selected / selected.sum()
+        ordered, _ = torch.sort(selected, descending=True)
+        top1_count = max(1, int(math.ceil(0.01 * ordered.numel())))
+        top5_count = max(1, int(math.ceil(0.05 * ordered.numel())))
+        effective = 1.0 / float(torch.sum(selected.square()).item())
+        return {
+            "joint_gap/segment_top1_mass": float(ordered[:top1_count].sum().item()),
+            "joint_gap/segment_top5_mass": float(ordered[:top5_count].sum().item()),
+            "joint_gap/effective_segment_count": effective,
+        }
+
     def state_dict(self) -> dict[str, Any]:
         state: dict[str, Any] = {
             "schema_version": ONLINE_LEARNING_SCHEMA_VERSION,
@@ -670,7 +939,46 @@ class OnlineLearningController:
                 field: ({key: tensor.detach().clone() for key, tensor in item.items()} if isinstance(item, dict) else item.detach().clone())
                 for field, item in value.__dict__.items()
             }
+        state["joint_gap"] = self._joint_gap_state_dict() if self.joint_gap_enabled else None
         return state
+
+    def _joint_gap_state_dict(self) -> dict[str, Any]:
+        joint_stats = self.statistics.joint_gap
+        if joint_stats is None:
+            raise RuntimeError("Joint-gap state requested without joint statistics.")
+
+        def frozen_dataclass(value: object | None) -> dict[str, Any] | None:
+            if value is None:
+                return None
+            result: dict[str, Any] = {}
+            for field, item in value.__dict__.items():
+                if isinstance(item, dict):
+                    result[field] = {
+                        key: tensor.detach().clone()
+                        for key, tensor in item.items()
+                    }
+                else:
+                    result[field] = item.detach().clone()
+            return result
+
+        return {
+            "schema_version": JOINT_GAP_SCHEMA_VERSION,
+            "enabled": True,
+            "config_hash": self.config_hash,
+            "settings": dict(self.joint_gap_settings),
+            "num_segments": self.num_segments,
+            "num_joints": int(self.joint_gap_settings["num_joints"]),
+            "num_difficulty_bins": int(self.joint_gap_settings["num_difficulty_bins"]),
+            "top_k": int(self.joint_gap_settings["top_k"]),
+            "difficulty_metadata_identity": self.joint_gap_settings.get("difficulty_metadata_identity", {}),
+            "joint_mapping_identity": {
+                "joint_names": list(self.joint_gap_settings.get("joint_names", ())),
+                "joint_mapping_hash": str(self.joint_gap_settings["joint_mapping_hash"]),
+            },
+            "statistics": joint_stats.state_dict(),
+            "joint_bin_calibration": frozen_dataclass(self.joint_bin_calibration),
+            "joint_gap_result": frozen_dataclass(self.joint_gap_result),
+        }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         if state.get("schema_version") != ONLINE_LEARNING_SCHEMA_VERSION:
@@ -735,6 +1043,15 @@ class OnlineLearningController:
             None if calibration_fields is None else BinCalibrationResult(**calibration_fields)
         )
         self.gap_result = None if gap_fields is None else GapResult(**gap_fields)
+        if self.joint_gap_enabled:
+            joint_gap_state = state.get("joint_gap")
+            if not isinstance(joint_gap_state, Mapping):
+                raise ValueError(
+                    "Joint-gap resume requires checkpoint online_learning['joint_gap'] state."
+                )
+            self._load_joint_gap_state_dict(joint_gap_state)
+        elif state.get("joint_gap") is not None:
+            raise ValueError("Checkpoint contains joint-gap state but the current run disables it.")
         if (self.segment_error_result is None) != (self.last_formula_update_iteration == -1):
             raise ValueError("Checkpoint formula cache and update cadence disagree.")
         expected_sampler_iteration = self.completed_window_count - 1
@@ -748,6 +1065,51 @@ class OnlineLearningController:
             raise ValueError("Checkpoint probability is newer than its formula cache.")
         self._validate_restored_caches()
         self.active.zero_()
+
+    def _load_joint_gap_state_dict(self, state: Mapping[str, Any]) -> None:
+        if state.get("schema_version") != JOINT_GAP_SCHEMA_VERSION:
+            raise ValueError("Unsupported joint-gap checkpoint schema.")
+        identity = {
+            "enabled": True,
+            "config_hash": self.config_hash,
+            "num_segments": self.num_segments,
+            "num_joints": int(self.joint_gap_settings["num_joints"]),
+            "num_difficulty_bins": int(self.joint_gap_settings["num_difficulty_bins"]),
+            "top_k": int(self.joint_gap_settings["top_k"]),
+        }
+        for name, expected in identity.items():
+            if state.get(name) != expected:
+                raise ValueError(f"Checkpoint joint-gap field '{name}' does not match.")
+        saved_settings = state.get("settings")
+        if not isinstance(saved_settings, Mapping) or dict(saved_settings) != self.joint_gap_settings:
+            raise ValueError("Checkpoint joint-gap settings do not match the current run.")
+        saved_mapping = state.get("joint_mapping_identity")
+        if not isinstance(saved_mapping, Mapping):
+            raise ValueError("Checkpoint joint-gap joint mapping identity is missing.")
+        if saved_mapping.get("joint_mapping_hash") != self.joint_gap_settings["joint_mapping_hash"]:
+            raise ValueError("Checkpoint joint-gap joint mapping hash does not match.")
+        statistics = state.get("statistics")
+        if not isinstance(statistics, Mapping) or self.statistics.joint_gap is None:
+            raise ValueError("Checkpoint joint-gap statistics state is missing.")
+        self.statistics.joint_gap.load_state_dict(statistics)
+
+        def restored_fields(name: str) -> dict[str, Any] | None:
+            saved = state.get(name)
+            if saved is None:
+                return None
+            if not isinstance(saved, Mapping):
+                raise ValueError(f"Checkpoint cached joint-gap field '{name}' is invalid.")
+            return {
+                field: torch.as_tensor(value, device=self.device).clone()
+                for field, value in saved.items()
+            }
+
+        calibration_fields = restored_fields("joint_bin_calibration")
+        result_fields = restored_fields("joint_gap_result")
+        self.joint_bin_calibration = (
+            None if calibration_fields is None else JointBinCalibrationResult(**calibration_fields)
+        )
+        self.joint_gap_result = None if result_fields is None else JointGapCorrectionResult(**result_fields)
 
     def _validate_restored_caches(self) -> None:
         """Validate derived checkpoint arrays before metrics or sampling can use them."""
@@ -810,6 +1172,14 @@ class OnlineLearningController:
         if self.difficulty_bins is None:
             if self.bin_calibration is not None or self.gap_result is not None:
                 raise ValueError("Checkpoint contains learning-gap caches without difficulty metadata.")
+            if self.joint_bin_calibration is not None or self.joint_gap_result is not None:
+                raise ValueError("Checkpoint contains joint-gap caches without difficulty metadata.")
+            return
+        if not self.generic_gap_enabled:
+            if self.bin_calibration is not None or self.gap_result is not None:
+                raise ValueError("Checkpoint contains generic learning-gap caches for a non-generic gap mode.")
+            if self.joint_gap_enabled:
+                self._validate_restored_joint_gap_caches()
             return
         if self.bin_calibration is None or self.gap_result is None:
             raise ValueError("Difficulty-enabled checkpoint is missing learning-gap caches.")
@@ -856,3 +1226,61 @@ class OnlineLearningController:
             raise ValueError("Checkpoint motion-gap component cache is incomplete.")
         for name, value in gap.contributions.items():
             vector(f"gap.contributions.{name}", value, self.num_motions)
+        if self.joint_gap_enabled:
+            self._validate_restored_joint_gap_caches()
+
+    def _validate_restored_joint_gap_caches(self) -> None:
+        if not self.joint_gap_enabled:
+            return
+        if self.joint_bin_calibration is None or self.joint_gap_result is None:
+            if self.segment_error_result is None:
+                return
+            raise ValueError("Joint-gap checkpoint is missing derived joint-gap caches.")
+
+        num_bins = int(self.joint_gap_settings["num_difficulty_bins"])
+        num_joints = int(self.joint_gap_settings["num_joints"])
+
+        def matrix(name: str, value: torch.Tensor, shape: tuple[int, int], *, boolean: bool = False) -> None:
+            if value.shape != shape:
+                raise ValueError(f"Checkpoint joint-gap cache '{name}' has the wrong shape.")
+            if boolean:
+                if value.dtype != torch.bool:
+                    raise ValueError(f"Checkpoint joint-gap cache '{name}' must be boolean.")
+            elif not torch.all(torch.isfinite(value)):
+                raise ValueError(f"Checkpoint joint-gap cache '{name}' must be finite.")
+
+        def vector(name: str, value: torch.Tensor, size: int, *, boolean: bool = False) -> None:
+            if value.shape != (size,):
+                raise ValueError(f"Checkpoint joint-gap cache '{name}' has the wrong shape.")
+            if boolean:
+                if value.dtype != torch.bool:
+                    raise ValueError(f"Checkpoint joint-gap cache '{name}' must be boolean.")
+            elif not torch.all(torch.isfinite(value)):
+                raise ValueError(f"Checkpoint joint-gap cache '{name}' must be finite.")
+
+        calibration = self.joint_bin_calibration
+        matrix("joint_bin.mean", calibration.mean, (num_bins, num_joints))
+        matrix("joint_bin.sigma", calibration.sigma, (num_bins, num_joints))
+        matrix("joint_bin.valid_segment_count", calibration.valid_segment_count, (num_bins, num_joints))
+        matrix("joint_bin.fallback_mask", calibration.fallback_mask, (num_bins, num_joints), boolean=True)
+        matrix("joint_bin.reliable_mask", calibration.reliable_mask, (num_bins, num_joints), boolean=True)
+        matrix("joint_bin.sigma_floor_mask", calibration.sigma_floor_mask, (num_bins, num_joints), boolean=True)
+        vector("joint_bin.global_mean", calibration.global_mean, num_joints)
+        vector("joint_bin.global_sigma", calibration.global_sigma, num_joints)
+        vector("joint_bin.global_valid_count", calibration.global_valid_count, num_joints)
+        if torch.any(calibration.sigma <= 0.0) or torch.any(calibration.global_sigma <= 0.0):
+            raise ValueError("Checkpoint joint-gap sigma cache is invalid.")
+
+        result = self.joint_gap_result
+        vector("joint_gap.corrected_priority", result.corrected_priority, self.num_segments)
+        vector("joint_gap.correction", result.correction, self.num_segments)
+        vector("joint_gap.raw_gate_mask", result.raw_gate_mask, self.num_segments, boolean=True)
+        vector("joint_gap.segment_gap_score", result.segment_gap_score, self.num_segments)
+        vector("joint_gap.segment_valid", result.segment_valid, self.num_segments, boolean=True)
+        vector("joint_gap.topk_selection_frequency", result.topk_selection_frequency, num_joints)
+        matrix("joint_gap.global_gap", result.global_gap, (self.num_segments, num_joints))
+        matrix("joint_gap.global_valid", result.global_valid, (self.num_segments, num_joints), boolean=True)
+        matrix("joint_gap.local_gap", result.local_gap, (self.num_segments, num_joints))
+        matrix("joint_gap.local_valid", result.local_valid, (self.num_segments, num_joints), boolean=True)
+        if torch.any(result.correction < 0.0) or torch.any(result.correction > 1.0):
+            raise ValueError("Checkpoint joint-gap correction is outside [0, 1].")

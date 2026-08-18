@@ -15,6 +15,7 @@ import torch
 
 
 ONLINE_STATS_SCHEMA_VERSION = "wbt.online_learning_stats.v1"
+JOINT_GAP_STATS_SCHEMA_VERSION = "wbt.joint_gap_stats.v1"
 _TRACKING_COMPONENTS = ("body_error", "joint_error", "orientation_error")
 _OUTCOME_COMPONENTS = ("termination", "completion", "success")
 _ALL_COMPONENTS = _TRACKING_COMPONENTS + _OUTCOME_COMPONENTS
@@ -32,6 +33,22 @@ def _long_vector(values: Sequence[int] | torch.Tensor, *, device: torch.device) 
     if tensor.ndim != 1:
         raise ValueError("Online statistics IDs must be one-dimensional.")
     return tensor
+
+
+def _float_matrix(values: Sequence[Sequence[float]] | torch.Tensor, *, device: torch.device) -> torch.Tensor:
+    tensor = torch.as_tensor(values, dtype=torch.float32, device=device)
+    if tensor.ndim != 2:
+        raise ValueError("Joint-specific online statistics values must be two-dimensional.")
+    return tensor
+
+
+def _stable_sequence_hash(values: Sequence[str]) -> str:
+    payload = [str(value) for value in values]
+    import hashlib
+    import json
+
+    encoded = json.dumps(payload, sort_keys=False, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def segment_traversal_outcomes(
@@ -120,6 +137,138 @@ def motion_episode_outcomes(
     return termination, completion, success
 
 
+class JointGapStatistics:
+    """Per-segment, per-joint EMA state used only by M7-JGap."""
+
+    def __init__(
+        self,
+        num_segments: int,
+        num_joints: int,
+        *,
+        ema_decay: float,
+        device: str | torch.device = "cpu",
+        config_hash: str = "",
+        joint_names: Sequence[str] = (),
+        joint_mapping_hash: str = "",
+    ) -> None:
+        if num_segments < 1 or num_joints < 1:
+            raise ValueError("num_segments and num_joints must be positive.")
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError("ema_decay must be in [0, 1).")
+        self.num_segments = int(num_segments)
+        self.num_joints = int(num_joints)
+        self.ema_decay = float(ema_decay)
+        self.device = torch.device(device)
+        self.config_hash = str(config_hash)
+        self.joint_names = tuple(str(name) for name in joint_names)
+        if self.joint_names and len(self.joint_names) != self.num_joints:
+            raise ValueError("joint_names length must match num_joints.")
+        self.joint_mapping_hash = str(joint_mapping_hash or _stable_sequence_hash(self.joint_names))
+
+        shape = (self.num_segments, self.num_joints)
+        self.segment_joint_error_ema = torch.zeros(shape, dtype=torch.float32, device=self.device)
+        self.segment_joint_error_initialized = torch.zeros(self.num_segments, dtype=torch.bool, device=self.device)
+        self.segment_joint_pending_sum = torch.zeros(shape, dtype=torch.float32, device=self.device)
+        self.segment_joint_pending_count = torch.zeros(self.num_segments, dtype=torch.long, device=self.device)
+
+    def _validate_segment_ids(self, ids: torch.Tensor) -> None:
+        if ids.numel() and (torch.any(ids < 0) or torch.any(ids >= self.num_segments)):
+            raise ValueError(f"segment_ids must be in [0, {self.num_segments}).")
+
+    def record_step_observations(
+        self,
+        segment_ids: Sequence[int] | torch.Tensor,
+        per_joint_error: Sequence[Sequence[float]] | torch.Tensor,
+    ) -> None:
+        segment = _long_vector(segment_ids, device=self.device)
+        error = _float_matrix(per_joint_error, device=self.device)
+        if error.shape != (segment.numel(), self.num_joints):
+            raise ValueError("per_joint_error must have shape (num_observations, num_joints).")
+        self._validate_segment_ids(segment)
+        if segment.numel() == 0:
+            return
+        finite_rows = torch.all(torch.isfinite(error), dim=1)
+        if torch.any(finite_rows & torch.any(error < 0.0, dim=1)):
+            raise ValueError("per_joint_error must be non-negative or NaN/Inf for ignored rows.")
+        if not torch.any(finite_rows):
+            return
+        valid_segment = segment[finite_rows]
+        valid_error = error[finite_rows]
+        self.segment_joint_pending_sum.index_add_(0, valid_segment, valid_error)
+        self.segment_joint_pending_count += torch.bincount(valid_segment, minlength=self.num_segments)
+
+    def commit_window(self) -> bool:
+        active = self.segment_joint_pending_count > 0
+        if not torch.any(active):
+            return False
+        batch_mean = (
+            self.segment_joint_pending_sum[active]
+            / self.segment_joint_pending_count[active].to(torch.float32)[:, None]
+        )
+        initialized = self.segment_joint_error_initialized[active]
+        current = self.segment_joint_error_ema[active]
+        self.segment_joint_error_ema[active] = torch.where(
+            initialized[:, None],
+            self.ema_decay * current + (1.0 - self.ema_decay) * batch_mean,
+            batch_mean,
+        )
+        self.segment_joint_error_initialized[active] = True
+        self.segment_joint_pending_sum.zero_()
+        self.segment_joint_pending_count.zero_()
+        return True
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": JOINT_GAP_STATS_SCHEMA_VERSION,
+            "num_segments": self.num_segments,
+            "num_joints": self.num_joints,
+            "ema_decay": self.ema_decay,
+            "config_hash": self.config_hash,
+            "joint_names": list(self.joint_names),
+            "joint_mapping_hash": self.joint_mapping_hash,
+            "segment_joint_error_ema": self.segment_joint_error_ema.detach().clone(),
+            "segment_joint_error_initialized": self.segment_joint_error_initialized.detach().clone(),
+            "segment_joint_pending_sum": self.segment_joint_pending_sum.detach().clone(),
+            "segment_joint_pending_count": self.segment_joint_pending_count.detach().clone(),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if state.get("schema_version") != JOINT_GAP_STATS_SCHEMA_VERSION:
+            raise ValueError("Unsupported joint-gap statistics schema version.")
+        identity = {
+            "num_segments": self.num_segments,
+            "num_joints": self.num_joints,
+            "ema_decay": self.ema_decay,
+            "config_hash": self.config_hash,
+            "joint_mapping_hash": self.joint_mapping_hash,
+        }
+        for name, expected in identity.items():
+            if state.get(name) != expected:
+                raise ValueError(f"Checkpoint joint-gap statistics field '{name}' does not match.")
+        saved_joint_names = tuple(str(name) for name in state.get("joint_names", ()))
+        if self.joint_names and saved_joint_names != self.joint_names:
+            raise ValueError("Checkpoint joint-gap joint order does not match.")
+
+        tensors = {
+            "segment_joint_error_ema": self.segment_joint_error_ema,
+            "segment_joint_error_initialized": self.segment_joint_error_initialized,
+            "segment_joint_pending_sum": self.segment_joint_pending_sum,
+            "segment_joint_pending_count": self.segment_joint_pending_count,
+        }
+        for name, target in tensors.items():
+            if name not in state:
+                raise ValueError(f"Joint-gap statistics state is missing field '{name}'.")
+            saved = torch.as_tensor(state[name], dtype=target.dtype, device=self.device)
+            if saved.shape != target.shape:
+                raise ValueError(f"Checkpoint joint-gap field '{name}' has the wrong shape.")
+            if target.dtype == torch.bool:
+                target.copy_(saved)
+                continue
+            if not torch.all(torch.isfinite(saved)) or torch.any(saved < 0):
+                raise ValueError(f"Checkpoint joint-gap field '{name}' must be finite and non-negative.")
+            target.copy_(saved)
+
+
 class OnlineLearningStatistics:
     """One shared set of window accumulators, cumulative counts and EMAs."""
 
@@ -131,6 +280,9 @@ class OnlineLearningStatistics:
         ema_decay: float,
         device: str | torch.device = "cpu",
         config_hash: str = "",
+        joint_gap_num_joints: int | None = None,
+        joint_gap_joint_names: Sequence[str] = (),
+        joint_gap_mapping_hash: str = "",
     ) -> None:
         if num_motions < 1 or num_segments < 1:
             raise ValueError("num_motions and num_segments must be positive.")
@@ -141,6 +293,17 @@ class OnlineLearningStatistics:
         self.ema_decay = float(ema_decay)
         self.device = torch.device(device)
         self.config_hash = str(config_hash)
+        self.joint_gap: JointGapStatistics | None = None
+        if joint_gap_num_joints is not None:
+            self.joint_gap = JointGapStatistics(
+                self.num_segments,
+                int(joint_gap_num_joints),
+                ema_decay=ema_decay,
+                device=self.device,
+                config_hash=self.config_hash,
+                joint_names=joint_gap_joint_names,
+                joint_mapping_hash=joint_gap_mapping_hash,
+            )
 
         self.segment_sample_count = torch.zeros(self.num_segments, dtype=torch.long, device=self.device)
         self.motion_sample_count = torch.zeros(self.num_motions, dtype=torch.long, device=self.device)
@@ -211,6 +374,7 @@ class OnlineLearningStatistics:
         body_error: Sequence[float] | torch.Tensor,
         joint_error: Sequence[float] | torch.Tensor,
         orientation_error: Sequence[float] | torch.Tensor,
+        per_joint_error: Sequence[Sequence[float]] | torch.Tensor | None = None,
     ) -> None:
         motion = _long_vector(motion_ids, device=self.device)
         segment = _long_vector(segment_ids, device=self.device)
@@ -228,6 +392,10 @@ class OnlineLearningStatistics:
         self.segment_step_count += torch.bincount(segment, minlength=self.num_segments)
         self.motion_step_count += torch.bincount(motion, minlength=self.num_motions)
         self.total_step_observations += motion.numel()
+        if self.joint_gap is not None:
+            if per_joint_error is None:
+                raise ValueError("Joint-gap statistics require per_joint_error observations.")
+            self.joint_gap.record_step_observations(segment, per_joint_error)
         for component, component_values in values.items():
             self._accumulate_component(
                 level="segment", component=component, ids=segment, values=component_values, size=self.num_segments
@@ -321,6 +489,8 @@ class OnlineLearningStatistics:
         for level in ("segment", "motion"):
             for component in _ALL_COMPONENTS:
                 changed = self._commit_component(level, component) or changed
+        if self.joint_gap is not None:
+            changed = self.joint_gap.commit_window() or changed
         if changed:
             self.ema_update_count += 1
         return changed
