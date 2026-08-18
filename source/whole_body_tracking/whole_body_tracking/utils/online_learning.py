@@ -983,6 +983,10 @@ class OnlineLearningController:
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         if state.get("schema_version") != ONLINE_LEARNING_SCHEMA_VERSION:
             raise ValueError("Unsupported online-learning checkpoint schema.")
+        if self.joint_gap_enabled and not isinstance(state.get("joint_gap"), Mapping):
+            raise ValueError(
+                "Joint-gap resume requires checkpoint online_learning['joint_gap'] state."
+            )
         if state.get("config_hash") != self.config_hash:
             raise ValueError("Checkpoint online-learning config identity does not match the current run.")
         statistics = state.get("statistics")
@@ -1045,10 +1049,7 @@ class OnlineLearningController:
         self.gap_result = None if gap_fields is None else GapResult(**gap_fields)
         if self.joint_gap_enabled:
             joint_gap_state = state.get("joint_gap")
-            if not isinstance(joint_gap_state, Mapping):
-                raise ValueError(
-                    "Joint-gap resume requires checkpoint online_learning['joint_gap'] state."
-                )
+            assert isinstance(joint_gap_state, Mapping)
             self._load_joint_gap_state_dict(joint_gap_state)
         elif state.get("joint_gap") is not None:
             raise ValueError("Checkpoint contains joint-gap state but the current run disables it.")
@@ -1080,8 +1081,18 @@ class OnlineLearningController:
         for name, expected in identity.items():
             if state.get(name) != expected:
                 raise ValueError(f"Checkpoint joint-gap field '{name}' does not match.")
+        saved_difficulty = state.get("difficulty_metadata_identity")
+        current_difficulty = self.joint_gap_settings.get("difficulty_metadata_identity", {})
+        if saved_difficulty != current_difficulty:
+            raise ValueError("Checkpoint joint-gap difficulty metadata identity does not match.")
         saved_settings = state.get("settings")
-        if not isinstance(saved_settings, Mapping) or dict(saved_settings) != self.joint_gap_settings:
+        if not isinstance(saved_settings, Mapping):
+            raise ValueError("Checkpoint joint-gap settings do not match the current run.")
+        saved_settings_without_difficulty = dict(saved_settings)
+        current_settings_without_difficulty = dict(self.joint_gap_settings)
+        saved_settings_without_difficulty.pop("difficulty_metadata_identity", None)
+        current_settings_without_difficulty.pop("difficulty_metadata_identity", None)
+        if saved_settings_without_difficulty != current_settings_without_difficulty:
             raise ValueError("Checkpoint joint-gap settings do not match the current run.")
         saved_mapping = state.get("joint_mapping_identity")
         if not isinstance(saved_mapping, Mapping):
