@@ -222,6 +222,36 @@ def _timing_summary(joint_gap_state: Mapping[str, Any]) -> dict[str, float]:
     }
 
 
+def _wandb_status(logs: str) -> str:
+    if not logs:
+        return "UNKNOWN - no W&B log text was provided"
+    lower = logs.lower()
+    if "wandb:" not in lower:
+        return "UNKNOWN - W&B log lines were not found"
+    wandb_error_lines = [
+        line.strip()
+        for line in logs.splitlines()
+        if line.lstrip().lower().startswith("wandb:") and any(token in line.lower() for token in ("error", "failed"))
+    ]
+    if wandb_error_lines:
+        return f"FAIL - W&B reported: {wandb_error_lines[0]}"
+    resumed = "resuming run" in lower
+    synced = "synced" in lower
+    run_url = "view run" in lower or "/whole_body_tracking_joint_gap/runs/" in lower
+    details = []
+    if resumed:
+        details.append("resume detected")
+    if synced:
+        details.append("sync completed")
+    if run_url:
+        details.append("run URL emitted")
+    if resumed and synced and run_url:
+        return "PASS - " + ", ".join(details)
+    if details:
+        return "PASS WITH WARNING - partial W&B evidence: " + ", ".join(details)
+    return "UNKNOWN - inspect W&B run page"
+
+
 def _checkpoint_health(path: Path, lambda_joint: float) -> dict[str, Any]:
     checkpoint, sampling_state = _load_checkpoint(path)
     online = sampling_state.get("online_learning")
@@ -707,7 +737,7 @@ def main() -> int:
 
     status, failures, warnings = _classification(rows, args.lambda_joint, args.final_iteration)
     logs = _load_logs(args.log_path, project_root)
-    wandb_status = "PASS" if "wandb:" in logs and "ERROR" not in logs.upper() else "UNKNOWN - inspect W&B run page"
+    wandb_status = _wandb_status(logs)
     manifest = {
         "schema_version": "wbt.joint_gap_stage4_smoke.v1",
         "run_name": args.run_name,
