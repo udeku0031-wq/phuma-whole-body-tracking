@@ -71,6 +71,30 @@ def _m7_raw_config() -> SimpleNamespace:
     return cfg
 
 
+def _m7_jgap_config() -> SimpleNamespace:
+    cfg = _m7_raw_config()
+    cfg.method_name = "M7-JGap"
+    cfg.segment_sampling.mode = "raw_error_joint_gap"
+    cfg.difficulty_calibration.enabled = True
+    cfg.difficulty_calibration.metadata_path = "difficulty.npz"
+    cfg.joint_gap = SimpleNamespace(
+        enabled=True,
+        lambda_joint=0.0,
+        num_joints=29,
+        ema_decay=0.95,
+        update_interval=50,
+        min_observations=32,
+        num_difficulty_bins=10,
+        positive_only=True,
+        local_center="motion_median",
+        aggregation="topk_mean",
+        top_k=6,
+        raw_gate=SimpleNamespace(enabled=True, mode="within_motion_median"),
+        transform="tanh",
+    )
+    return cfg
+
+
 def _command_method(name: str) -> ast.FunctionDef:
     module = ast.parse(COMMANDS_PATH.read_text(encoding="utf-8"), filename=str(COMMANDS_PATH))
     command = next(
@@ -138,6 +162,37 @@ class DiversityConfigContractTest(unittest.TestCase):
         cfg.diversity_constraint.enabled = False
         with self.assertRaisesRegex(ValueError, "requires diversity_constraint"):
             validate(cfg)
+
+    def test_m7_jgap_contract_keeps_generic_gap_off_and_joint_gap_on(self) -> None:
+        validate = _validator()
+        cfg = _m7_jgap_config()
+        validate(cfg)
+        self.assertEqual(cfg.motion_sampling.mode, "raw_error")
+        self.assertEqual(cfg.segment_sampling.mode, "raw_error_joint_gap")
+        self.assertTrue(cfg.quality_gate.enabled)
+        self.assertTrue(cfg.diversity_constraint.enabled)
+        self.assertTrue(cfg.difficulty_calibration.enabled)
+        self.assertTrue(cfg.joint_gap.enabled)
+
+        cfg = _m7_jgap_config()
+        cfg.motion_sampling.mode = "learning_gap"
+        cfg.segment_sampling.mode = "relative_learning_gap"
+        with self.assertRaisesRegex(ValueError, "requires motion/segment modes"):
+            validate(cfg)
+
+        cfg = _m7_jgap_config()
+        cfg.joint_gap.enabled = False
+        with self.assertRaisesRegex(ValueError, "requires joint_gap.enabled"):
+            validate(cfg)
+
+        cfg = _m7_jgap_config()
+        cfg.joint_gap.top_k = 30
+        with self.assertRaisesRegex(ValueError, "top_k"):
+            validate(cfg)
+
+        cfg = _m7_raw_config()
+        self.assertFalse(hasattr(cfg, "joint_gap"))
+        validate(cfg)
 
     def test_m0_through_m6_keep_diversity_disabled(self) -> None:
         validate = _validator()
