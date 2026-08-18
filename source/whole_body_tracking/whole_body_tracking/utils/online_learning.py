@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -227,6 +228,7 @@ class OnlineLearningController:
         self.gap_result: GapResult | None = None
         self.joint_bin_calibration: JointBinCalibrationResult | None = None
         self.joint_gap_result: JointGapCorrectionResult | None = None
+        self.joint_gap_update_ms: list[float] = []
 
         self.active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.episode_motion_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -681,6 +683,7 @@ class OnlineLearningController:
         )
 
     def _update_joint_gap_formula(self) -> None:
+        start_time = time.perf_counter()
         if self.difficulty_bins is None:
             raise RuntimeError("Joint Gap requires difficulty bins.")
         joint_stats = self.statistics.joint_gap
@@ -721,6 +724,7 @@ class OnlineLearningController:
             lambda_joint=float(self.joint_gap_settings["lambda_joint"]),
             gap_clip=float(self.settings["gap_clip"]),
         )
+        self.joint_gap_update_ms.append((time.perf_counter() - start_time) * 1000.0)
 
     def metrics(self) -> dict[str, float | int]:
         metrics: dict[str, float | int] = {
@@ -843,6 +847,9 @@ class OnlineLearningController:
                 metrics[f"joint_gap/{name}_mean"] = 0.0
                 metrics[f"joint_gap/{name}_p90"] = 0.0
                 metrics[f"joint_gap/{name}_max"] = 0.0
+            metrics["joint_gap/update_ms_mean"] = 0.0
+            metrics["joint_gap/update_ms_p90"] = 0.0
+            metrics["joint_gap/update_ms_max"] = 0.0
             metrics["joint_gap/active_segment_fraction"] = 0.0
             metrics["joint_gap/raw_gate_pass_fraction"] = 0.0
             metrics["joint_gap/segment_top1_mass"] = 0.0
@@ -871,6 +878,17 @@ class OnlineLearningController:
                 ),
             }
         )
+        if self.joint_gap_update_ms:
+            timings = torch.tensor(self.joint_gap_update_ms, dtype=torch.float64)
+            metrics["joint_gap/update_ms_mean"] = float(timings.mean().item())
+            metrics["joint_gap/update_ms_p90"] = float(
+                torch.quantile(timings, torch.tensor(0.90, dtype=timings.dtype)).item()
+            )
+            metrics["joint_gap/update_ms_max"] = float(timings.max().item())
+        else:
+            metrics["joint_gap/update_ms_mean"] = 0.0
+            metrics["joint_gap/update_ms_p90"] = 0.0
+            metrics["joint_gap/update_ms_max"] = 0.0
         for joint_id in range(joint_stats.num_joints):
             valid = result.local_valid[:, joint_id]
             positive = result.local_gap[:, joint_id][valid & (result.local_gap[:, joint_id] > 0.0)]
@@ -978,6 +996,9 @@ class OnlineLearningController:
             "statistics": joint_stats.state_dict(),
             "joint_bin_calibration": frozen_dataclass(self.joint_bin_calibration),
             "joint_gap_result": frozen_dataclass(self.joint_gap_result),
+            "timing_ms": {
+                "joint_gap_update": list(self.joint_gap_update_ms),
+            },
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -1121,6 +1142,14 @@ class OnlineLearningController:
             None if calibration_fields is None else JointBinCalibrationResult(**calibration_fields)
         )
         self.joint_gap_result = None if result_fields is None else JointGapCorrectionResult(**result_fields)
+        timing = state.get("timing_ms", {})
+        if isinstance(timing, Mapping):
+            values = timing.get("joint_gap_update", ())
+            self.joint_gap_update_ms = [float(value) for value in values]
+            if any((not math.isfinite(value) or value < 0.0) for value in self.joint_gap_update_ms):
+                raise ValueError("Checkpoint joint-gap timing values must be finite and non-negative.")
+        else:
+            self.joint_gap_update_ms = []
 
     def _validate_restored_caches(self) -> None:
         """Validate derived checkpoint arrays before metrics or sampling can use them."""
