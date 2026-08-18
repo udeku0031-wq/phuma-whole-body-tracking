@@ -13,6 +13,7 @@ from isaaclab.app import AppLauncher
 # local imports
 import cli_args  # isort: skip
 import evaluation_utils as eval_utils  # isort: skip
+import joint_diagnostics as joint_diag  # isort: skip
 
 
 parser = argparse.ArgumentParser(description="Evaluate an RSL-RL WBT checkpoint on a fixed motion manifest.")
@@ -29,6 +30,12 @@ parser.add_argument("--episode_length_s", type=float, default=60.0, help="Evalua
 parser.add_argument("--deterministic", action="store_true", help="Use deterministic inference policy.")
 parser.add_argument("--confirm_final_test", "--confirm-final-test", action="store_true", help="Allow evaluation on the frozen final test manifest.")
 parser.add_argument("--dry_run", "--dry-run", action="store_true", help="Print evaluation configuration without launching Isaac Sim.")
+parser.add_argument(
+    "--joint_diagnostics",
+    "--joint-diagnostics",
+    action="store_true",
+    help="Write opt-in per-joint diagnostic CSV/JSON files in --output_dir.",
+)
 parser.add_argument(
     "--disable_randomization",
     "--disable-randomization",
@@ -55,6 +62,7 @@ if args_cli.dry_run:
     print(f"  seed: {args_cli.seed}")
     print(f"  deterministic: {args_cli.deterministic}")
     print(f"  disable_randomization: {args_cli.disable_randomization}")
+    print(f"  joint_diagnostics: {args_cli.joint_diagnostics}")
     print(f"  resume: {args_cli.resume}")
     sys.exit(0)
 
@@ -80,6 +88,7 @@ import pathlib
 import random
 import re
 from collections import Counter
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -223,6 +232,60 @@ def _termination_reason(env, env_idx: int) -> str:
         except Exception:
             continue
     return "+".join(reasons) if reasons else "done"
+
+
+def _load_reference_joint_names(motion_path: Path, fallback: Sequence[str]) -> list[str]:
+    try:
+        with np.load(motion_path, allow_pickle=False) as data:
+            if "joint_names" not in data.files:
+                return [str(name) for name in fallback]
+            names = np.asarray(data["joint_names"]).astype(str).tolist()
+            return [str(name) for name in names]
+    except Exception:
+        return [str(name) for name in fallback]
+
+
+def _names_from_sequence(value) -> list[str] | None:
+    if value is None:
+        return None
+    try:
+        names = [str(item) for item in value]
+    except TypeError:
+        return None
+    return names if names else None
+
+
+def _extract_action_joint_names(base_env, fallback: Sequence[str]) -> list[str]:
+    action_manager = getattr(base_env, "action_manager", None)
+    if action_manager is not None:
+        try:
+            action_term = action_manager.get_term("joint_pos")
+        except Exception:
+            action_term = None
+        if action_term is not None:
+            for attr_name in ("joint_names", "_joint_names"):
+                names = _names_from_sequence(getattr(action_term, attr_name, None))
+                if names is not None:
+                    return names
+            asset = getattr(action_term, "_asset", None)
+            names = _names_from_sequence(getattr(asset, "joint_names", None))
+            if names is not None:
+                return names
+    return [str(name) for name in fallback]
+
+
+def _segment_layout_from_command(command, num_motions: int) -> joint_diag.SegmentLayout | None:
+    segment_index = getattr(command, "segment_index", None)
+    if segment_index is None:
+        return None
+    motion_offsets = segment_index.motion_segment_offsets
+    num_segments = int(motion_offsets[num_motions].item())
+    return joint_diag.SegmentLayout(
+        segment_motion_ids=segment_index.segment_motion_ids[:num_segments].detach().clone(),
+        segment_local_ids=segment_index.segment_local_ids[:num_segments].detach().clone(),
+        segment_start_frames=segment_index.segment_start_frames[:num_segments].detach().clone(),
+        segment_end_frames=segment_index.segment_end_frames[:num_segments].detach().clone(),
+    )
 
 
 def _summary(results: list[dict[str, object]]) -> dict[str, object]:
@@ -372,6 +435,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise RuntimeError(f"Existing per_motion.csv contains duplicate motion rows: {duplicates[:5]}")
         if unexpected:
             raise RuntimeError(f"Existing per_motion.csv contains motions outside this manifest: {unexpected[:5]}")
+        if args_cli.joint_diagnostics and results:
+            raise RuntimeError("Joint diagnostics cannot resume from per_motion.csv because per-joint sums are not persisted.")
 
     completed_paths = {str(row.get("motion_path", "")) for row in results}
     pending_indices = [index for index, path in enumerate(expected_motion_paths) if path not in completed_paths]
@@ -419,6 +484,48 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if manifest_path is not None:
         evaluation_config["manifest_path"] = str(manifest_path)
 
+    joint_accumulator = None
+    joint_mapping_rows = None
+    if args_cli.joint_diagnostics:
+        robot_joint_names = [str(name) for name in command.robot.joint_names]
+        reference_joint_names = _load_reference_joint_names(motion_paths[0], robot_joint_names) if motion_paths else robot_joint_names
+        action_joint_names = _extract_action_joint_names(base_env, robot_joint_names)
+        evaluator_joint_names = robot_joint_names
+        joint_mapping_rows = joint_diag.joint_mapping_rows(
+            robot_joint_names,
+            reference_joint_names=reference_joint_names,
+            action_joint_names=action_joint_names,
+            evaluator_joint_names=evaluator_joint_names,
+        )
+        categories: list[str] = []
+        source_groups: list[str] = []
+        for path in motion_paths:
+            category, source_group = eval_utils.motion_info(path, project_root, metadata_lookup)
+            categories.append(category)
+            source_groups.append(source_group)
+        joint_accumulator = joint_diag.JointDiagnosticsAccumulator(
+            motion_paths=expected_motion_paths,
+            categories=categories,
+            source_groups=source_groups,
+            motion_lengths=motion_lengths,
+            joint_names=robot_joint_names,
+            device=base_env.device,
+            segment_layout=_segment_layout_from_command(command, total_motions),
+        )
+        joint_diag.write_joint_mapping_csv(output_dir / "joint_mapping.csv", joint_mapping_rows)
+        evaluation_config["joint_diagnostics"] = {
+            "enabled": True,
+            "joint_count": len(robot_joint_names),
+            "joint_mapping_hash": joint_diag.mapping_hash(joint_mapping_rows),
+            "per_joint_outputs": [
+                "joint_mapping.csv",
+                "per_joint_summary.csv",
+                "per_motion_joint_diagnostics.csv",
+                "per_segment_joint_diagnostics.csv",
+                "joint_diagnostic_summary.json",
+            ],
+        }
+
     completed_since_print = 0
     for batch_start in range(0, len(pending_indices), env.num_envs):
         if not simulation_app.is_running():
@@ -447,6 +554,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             command._update_metrics()
             body_error_sums[active_ids] += command.metrics["error_body_pos"][active_ids]
             joint_error_sums[active_ids] += command.metrics["error_joint_pos"][active_ids]
+            if joint_accumulator is not None:
+                current_segment_ids = command.current_global_segment_ids
+                joint_accumulator.record_step(
+                    motion_ids=command.motion_ids[active_ids],
+                    segment_ids=current_segment_ids[active_ids] if current_segment_ids is not None else None,
+                    joint_error=command.joint_pos[active_ids] - command.robot_joint_pos[active_ids],
+                    aggregate_l2=command.metrics["error_joint_pos"][active_ids],
+                )
             metric_counts[active_ids] += 1
 
             with torch.no_grad():
@@ -542,6 +657,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("[INFO]: Evaluation complete.")
     print(f"[INFO]: per_motion.csv: {output_dir / 'per_motion.csv'}")
     print(f"[INFO]: summary.json: {output_dir / 'summary.json'}")
+    if joint_accumulator is not None:
+        assert joint_mapping_rows is not None
+        diagnostic_summary = joint_accumulator.write_outputs(
+            output_dir,
+            mapping_rows=joint_mapping_rows,
+            evaluation_config=evaluation_config,
+        )
+        print(f"[INFO]: joint_mapping.csv: {output_dir / 'joint_mapping.csv'}")
+        print(f"[INFO]: per_joint_summary.csv: {output_dir / 'per_joint_summary.csv'}")
+        print(f"[INFO]: joint diagnostics max L2 consistency error={diagnostic_summary['max_l2_consistency_error']:.6e}")
     print(
         f"[INFO]: success_rate={summary['micro_success_rate']:.4f}, "
         f"macro_success_rate={summary['macro_success_rate']:.4f}, "
