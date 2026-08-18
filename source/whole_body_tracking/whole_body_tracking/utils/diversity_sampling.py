@@ -980,7 +980,7 @@ class DiversityConstrainedSampler:
             min_fraction = 0.0
 
         result: dict[str, float | int] = {
-            "mode": 7,
+            "mode": 8 if self.segment_mode == "raw_error_joint_gap" else 7,
             "warmup_active": int(self.warmup_active),
             "probability_update_count": self.probability_update_count,
             **self._distribution_metrics,

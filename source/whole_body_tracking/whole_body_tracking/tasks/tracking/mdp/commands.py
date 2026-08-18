@@ -28,7 +28,7 @@ from isaaclab.utils.math import (
 from whole_body_tracking.utils.cluster_metadata import MotionClusterMetadata
 from whole_body_tracking.utils.difficulty import DEFAULT_ALGORITHM_SCHEMA_VERSION
 from whole_body_tracking.utils.difficulty_metadata import SegmentDifficultyMetadata
-from whole_body_tracking.utils.online_learning import OnlineLearningController
+from whole_body_tracking.utils.online_learning import OnlineLearningController, canonical_joint_mapping_hash
 from whole_body_tracking.utils.quality_metadata import (
     QUALITY_STATUS_TO_CODE,
     SegmentQualityMetadata,
@@ -287,18 +287,20 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         "M6": ("learning_gap", "relative_learning_gap"),
         "M7": ("learning_gap", "relative_learning_gap"),
         "M7-Raw": ("raw_error", "raw_error"),
+        "M7-JGap": ("raw_error", "raw_error_joint_gap"),
         "DIVERSITY_ONLY": ("uniform", "uniform"),
         "GLOBAL_BIN_RAW_ERROR": ("uniform", "global_bin_raw_error"),
     }
     if cfg.method_name not in method_modes:
         raise NotImplementedError(
             f"Research method '{cfg.method_name}' is not implemented; use M0--M7, "
-            "M7-Raw, DIVERSITY_ONLY, or GLOBAL_BIN_RAW_ERROR."
+            "M7-Raw, M7-JGap, DIVERSITY_ONLY, or GLOBAL_BIN_RAW_ERROR."
         )
     known_motion_modes = {"uniform", "raw_error", "learning_gap"}
     known_segment_modes = {
         "uniform",
         "raw_error",
+        "raw_error_joint_gap",
         "relative_learning_gap",
         "global_bin_raw_error",
     }
@@ -319,7 +321,7 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         )
     if cfg.method_name in {"M0", "M2", "M3", "M4", "M5", "DIVERSITY_ONLY"} and cfg.quality_gate.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires quality_gate.enabled=False.")
-    if cfg.method_name in {"M1", "M6", "M7", "M7-Raw"} and not cfg.quality_gate.enabled:
+    if cfg.method_name in {"M1", "M6", "M7", "M7-Raw", "M7-JGap"} and not cfg.quality_gate.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires quality_gate.enabled=True.")
     if cfg.method_name in {
         "M2",
@@ -330,13 +332,13 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         "GLOBAL_BIN_RAW_ERROR",
     } and cfg.difficulty_calibration.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' must not use difficulty calibration.")
-    if cfg.method_name in {"M5", "M6", "M7"} and not cfg.difficulty_calibration.enabled:
+    if cfg.method_name in {"M5", "M6", "M7", "M7-JGap"} and not cfg.difficulty_calibration.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires difficulty calibration.")
     diversity_enabled = bool(cfg.diversity_constraint.enabled)
-    if cfg.method_name in {"M7", "M7-Raw", "DIVERSITY_ONLY"} and not diversity_enabled:
+    if cfg.method_name in {"M7", "M7-Raw", "M7-JGap", "DIVERSITY_ONLY"} and not diversity_enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires diversity_constraint.enabled=True.")
-    if cfg.method_name not in {"M7", "M7-Raw", "DIVERSITY_ONLY"} and diversity_enabled:
-        raise ValueError("Cluster diversity is only valid for M7, M7-Raw, or the DIVERSITY_ONLY diagnostic.")
+    if cfg.method_name not in {"M7", "M7-Raw", "M7-JGap", "DIVERSITY_ONLY"} and diversity_enabled:
+        raise ValueError("Cluster diversity is only valid for M7, M7-Raw, M7-JGap, or the DIVERSITY_ONLY diagnostic.")
     if diversity_enabled:
         diversity = cfg.diversity_constraint
         if not cfg.segment.enabled:
@@ -375,7 +377,7 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         raise ValueError("Adaptive sampling modes require online_learning.enabled=True.")
     if online_enabled and not online_statistics_enabled:
         raise ValueError("online_learning.enabled=True requires statistics_enabled=True.")
-    if cfg.method_name in {"M5", "M6", "M7"} and cfg.difficulty_calibration.expected_num_bins < 2:
+    if cfg.method_name in {"M5", "M6", "M7", "M7-JGap"} and cfg.difficulty_calibration.expected_num_bins < 2:
         raise ValueError("Learning-gap modes require at least two difficulty bins.")
     if not math.isfinite(cfg.segment.length_seconds) or cfg.segment.length_seconds <= 0.0:
         raise ValueError("segment.length_seconds must be finite and greater than zero.")
@@ -427,7 +429,7 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
                 "quality_gate.empty_motion_policy must be one of "
                 f"{sorted(QualityGatedStartIndex._EMPTY_MOTION_POLICIES)}."
             )
-        if cfg.method_name in {"M6", "M7"} and cfg.quality_gate.empty_motion_policy != "exclude":
+        if cfg.method_name in {"M6", "M7", "M7-JGap"} and cfg.quality_gate.empty_motion_policy != "exclude":
             raise ValueError(f"{cfg.method_name} requires quality_gate.empty_motion_policy='exclude'.")
 
     if online_cfg is not None:
@@ -449,6 +451,42 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
             value = float(getattr(online_cfg, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"online_learning.{name} must be finite and positive.")
+    joint_gap_cfg = getattr(cfg, "joint_gap", None)
+    joint_gap_enabled = bool(getattr(joint_gap_cfg, "enabled", False))
+    if joint_gap_enabled and cfg.method_name != "M7-JGap":
+        raise ValueError("joint_gap.enabled=True is only legal for method_name='M7-JGap'.")
+    if cfg.method_name == "M7-JGap" and not joint_gap_enabled:
+        raise ValueError("method_name='M7-JGap' requires joint_gap.enabled=True.")
+    if joint_gap_enabled:
+        if not cfg.difficulty_calibration.enabled:
+            raise ValueError("Joint Gap requires difficulty_calibration.enabled=True.")
+        if int(joint_gap_cfg.num_joints) < 1:
+            raise ValueError("joint_gap.num_joints must be positive.")
+        if int(joint_gap_cfg.num_difficulty_bins) != int(cfg.difficulty_calibration.expected_num_bins):
+            raise ValueError("joint_gap.num_difficulty_bins must match difficulty_calibration.expected_num_bins.")
+        if int(joint_gap_cfg.top_k) < 1 or int(joint_gap_cfg.top_k) > int(joint_gap_cfg.num_joints):
+            raise ValueError("joint_gap.top_k must be in [1, num_joints].")
+        if int(joint_gap_cfg.update_interval) != int(cfg.online_learning.probability_update_interval):
+            raise ValueError("joint_gap.update_interval must match online_learning.probability_update_interval.")
+        if int(joint_gap_cfg.min_observations) != int(cfg.online_learning.min_segment_observations):
+            raise ValueError("joint_gap.min_observations must match online_learning.min_segment_observations.")
+        lambda_joint = float(joint_gap_cfg.lambda_joint)
+        if not math.isfinite(lambda_joint) or lambda_joint < 0.0:
+            raise ValueError("joint_gap.lambda_joint must be non-negative.")
+        if not 0.0 <= float(joint_gap_cfg.ema_decay) < 1.0:
+            raise ValueError("joint_gap.ema_decay must be in [0, 1).")
+        if not math.isclose(float(joint_gap_cfg.ema_decay), float(cfg.online_learning.ema_decay), rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError("joint_gap.ema_decay must match online_learning.ema_decay.")
+        raw_gate = getattr(joint_gap_cfg, "raw_gate", None)
+        if not bool(getattr(raw_gate, "enabled", False)) or getattr(raw_gate, "mode", "") != "within_motion_median":
+            raise NotImplementedError("M7-JGap requires raw_gate.enabled=True and mode='within_motion_median'.")
+        if (
+            getattr(joint_gap_cfg, "local_center", "") != "motion_median"
+            or getattr(joint_gap_cfg, "aggregation", "") != "topk_mean"
+            or getattr(joint_gap_cfg, "transform", "") != "tanh"
+            or not bool(getattr(joint_gap_cfg, "positive_only", False))
+        ):
+            raise NotImplementedError("M7-JGap uses positive-only top-k tanh correction centered by motion median.")
     adaptive_cfg = getattr(cfg, "adaptive_sampling", None)
     if adaptive_cfg is not None:
         if not 0.0 <= float(adaptive_cfg.uniform_mix) <= 1.0:
@@ -578,6 +616,14 @@ class MotionCommand(CommandTerm):
                 f"but task robot '{self.cfg.asset_name}' has {expected_joint_count} joints. "
                 "This would change the policy observation size. For PHUMA G1 data, convert it with "
                 "scripts/phuma_to_npz.py so dof_pos is mapped to the same Isaac G1 joint order."
+            )
+        if (
+            self.cfg.research.joint_gap.enabled
+            and int(self.cfg.research.joint_gap.num_joints) != expected_joint_count
+        ):
+            raise ValueError(
+                f"joint_gap.num_joints={self.cfg.research.joint_gap.num_joints} does not match "
+                f"the task robot joint count {expected_joint_count}."
             )
         print(
             f"[INFO]: Loaded {self.motion.num_motions} motion(s), "
@@ -968,11 +1014,38 @@ class MotionCommand(CommandTerm):
         """Return JSON-compatible provisional module-three semantics."""
 
         online = self.cfg.research.online_learning
+        joint_gap = self.cfg.research.joint_gap
         error = self.cfg.research.error_definition
         motion_error = self.cfg.research.motion_error
         motion_gap = self.cfg.research.motion_gap
         adaptive = self.cfg.research.adaptive_sampling
-        return {
+        joint_names = list(self.robot.joint_names)
+        joint_gap_config: dict[str, object] | None = None
+        if joint_gap.enabled:
+            if self.difficulty_metadata is None:
+                raise RuntimeError("Joint Gap requires initialized difficulty metadata.")
+            joint_gap_config = {
+                "enabled": joint_gap.enabled,
+                "lambda_joint": joint_gap.lambda_joint,
+                "num_joints": joint_gap.num_joints,
+                "ema_decay": joint_gap.ema_decay,
+                "update_interval": joint_gap.update_interval,
+                "min_observations": joint_gap.min_observations,
+                "num_difficulty_bins": joint_gap.num_difficulty_bins,
+                "positive_only": joint_gap.positive_only,
+                "local_center": joint_gap.local_center,
+                "aggregation": joint_gap.aggregation,
+                "top_k": joint_gap.top_k,
+                "raw_gate": {
+                    "enabled": joint_gap.raw_gate.enabled,
+                    "mode": joint_gap.raw_gate.mode,
+                },
+                "transform": joint_gap.transform,
+                "joint_names": joint_names,
+                "joint_mapping_hash": canonical_joint_mapping_hash(joint_names),
+            }
+            joint_gap_config["difficulty_metadata_identity"] = self._difficulty_identity_state()
+        settings = {
             "statistics_enabled": online.statistics_enabled,
             "warmup_iterations": online.warmup_iterations,
             "probability_update_interval": online.probability_update_interval,
@@ -1021,6 +1094,9 @@ class MotionCommand(CommandTerm):
             "segment_probability_cap": adaptive.segment_probability_cap,
             "fallback": adaptive.fallback,
         }
+        if joint_gap_config is not None:
+            settings["joint_gap"] = joint_gap_config
+        return settings
 
     def _diversity_sampling_settings(self) -> dict[str, object]:
         """Return immutable M7 cluster budget and metadata identities."""
@@ -1173,11 +1249,20 @@ class MotionCommand(CommandTerm):
                 torch.square(self.joint_pos[selected] - self.robot_joint_pos[selected]), dim=-1
             )
         )
+        per_joint_error = (
+            torch.abs(self.joint_pos[selected] - self.robot_joint_pos[selected])
+            if self.online_learning is not None and self.online_learning.joint_gap_enabled
+            else None
+        )
         orientation_error = quat_error_magnitude(
             self.body_quat_relative_w[selected], self.robot_body_quat_w[selected]
         ).mean(dim=-1)
         self._record_online_learning_components(
-            body_error, joint_error, orientation_error, env_ids=selected if env_ids is not None else None
+            body_error,
+            joint_error,
+            orientation_error,
+            per_joint_error=per_joint_error,
+            env_ids=selected if env_ids is not None else None,
         )
 
     def _record_online_learning_components(
@@ -1186,6 +1271,7 @@ class MotionCommand(CommandTerm):
         joint_error: torch.Tensor,
         orientation_error: torch.Tensor,
         *,
+        per_joint_error: torch.Tensor | None = None,
         env_ids: Sequence[int] | torch.Tensor | None,
     ) -> None:
         if self.online_learning is None:
@@ -1196,6 +1282,7 @@ class MotionCommand(CommandTerm):
             body_error=body_error,
             joint_error=joint_error,
             orientation_error=orientation_error,
+            per_joint_error=per_joint_error,
             env_ids=env_ids,
         )
 
@@ -1333,7 +1420,8 @@ class MotionCommand(CommandTerm):
             dim=-1
         )
 
-        self.metrics["error_joint_pos"] = torch.norm(self.joint_pos - self.robot_joint_pos, dim=-1)
+        joint_delta = self.joint_pos - self.robot_joint_pos
+        self.metrics["error_joint_pos"] = torch.norm(joint_delta, dim=-1)
         self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
         if self.online_learning is not None and record_online:
             reset_mask = getattr(
@@ -1346,6 +1434,11 @@ class MotionCommand(CommandTerm):
                 self.metrics["error_body_pos"],
                 self.metrics["error_joint_pos"] / math.sqrt(self.robot_joint_pos.shape[-1]),
                 self.metrics["error_body_rot"],
+                per_joint_error=(
+                    torch.abs(joint_delta)
+                    if self.online_learning.joint_gap_enabled
+                    else None
+                ),
                 env_ids=active_env_ids,
             )
 
@@ -1994,6 +2087,19 @@ class MotionCommand(CommandTerm):
                     "online_provisional": self.cfg.research.online_learning.provisional,
                 }
             )
+            if self.cfg.research.joint_gap.enabled:
+                metadata.update(
+                    {
+                        "joint_gap_enabled": True,
+                        "joint_gap_lambda_joint": self.cfg.research.joint_gap.lambda_joint,
+                        "joint_gap_num_joints": self.cfg.research.joint_gap.num_joints,
+                        "joint_gap_top_k": self.cfg.research.joint_gap.top_k,
+                        "joint_gap_num_difficulty_bins": self.cfg.research.joint_gap.num_difficulty_bins,
+                        "joint_gap_joint_mapping_hash": canonical_joint_mapping_hash(self.robot.joint_names),
+                        "joint_gap_segment_mode": self.cfg.research.segment_sampling.mode,
+                        "joint_gap_motion_mode": self.cfg.research.motion_sampling.mode,
+                    }
+                )
         return metadata
 
     def sampling_state_dict(self) -> dict[str, object]:
@@ -2475,6 +2581,33 @@ class DifficultyCalibrationCfg:
 
 
 @configclass
+class JointGapRawGateCfg:
+    """Raw-priority gate for joint-specific segment correction."""
+
+    enabled: bool = True
+    mode: str = "within_motion_median"
+
+
+@configclass
+class JointGapCfg:
+    """Joint-specific difficulty-calibrated learning-gap correction."""
+
+    enabled: bool = False
+    lambda_joint: float = 0.0
+    num_joints: int = 29
+    ema_decay: float = 0.95
+    update_interval: int = 50
+    min_observations: int = 32
+    num_difficulty_bins: int = 10
+    positive_only: bool = True
+    local_center: str = "motion_median"
+    aggregation: str = "topk_mean"
+    top_k: int = 6
+    raw_gate: JointGapRawGateCfg = JointGapRawGateCfg()
+    transform: str = "tanh"
+
+
+@configclass
 class OnlineLearningCfg:
     """Shared online state cadence and cold-start thresholds (provisional v1)."""
 
@@ -2593,6 +2726,7 @@ class ResearchExperimentCfg:
     segment: SegmentInfrastructureCfg = SegmentInfrastructureCfg()
     quality_gate: QualityGateCfg = QualityGateCfg()
     difficulty_calibration: DifficultyCalibrationCfg = DifficultyCalibrationCfg()
+    joint_gap: JointGapCfg = JointGapCfg()
     online_learning: OnlineLearningCfg = OnlineLearningCfg()
     error_definition: ErrorDefinitionCfg = ErrorDefinitionCfg()
     motion_error: MotionErrorCfg = MotionErrorCfg()
