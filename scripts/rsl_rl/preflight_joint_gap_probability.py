@@ -425,9 +425,9 @@ def run_preflight(
 
 def _write_outputs(output_dir: Path, report: Mapping[str, Any], per_motion_rows: Sequence[Mapping[str, Any]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    json_path = output_dir / "joint_gap_probability_preflight.json"
+    json_path = output_dir / "preflight_probability.json"
     json_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
-    csv_path = output_dir / "joint_gap_probability_preflight_per_motion.csv"
+    csv_path = output_dir / "preflight_probability_per_motion.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=["motion_id", "num_segments", "tv", "raw_max", "jgap_max"])
         writer.writeheader()
@@ -490,7 +490,7 @@ def _write_outputs(output_dir: Path, report: Mapping[str, Any], per_motion_rows:
     if report["warnings"]:
         lines.extend(["", "## Warnings", ""])
         lines.extend(f"- {item}" for item in report["warnings"])
-    (output_dir / "joint_gap_probability_preflight.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output_dir / "preflight_probability_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:

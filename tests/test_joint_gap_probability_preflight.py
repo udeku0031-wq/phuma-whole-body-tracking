@@ -125,6 +125,8 @@ class JointGapProbabilityPreflightTest(unittest.TestCase):
                 project_root=PROJECT_ROOT,
             )
             self.assertEqual(report["status"], "PASS")
+            self.assertGreater(report["raw_rebuild_probability_updates"], 0)
+            self.assertGreater(report["jgap_rebuild_probability_updates"], 0)
             self.assertEqual(report["max_abs_diff_cluster_probability"], 0.0)
             self.assertEqual(report["max_abs_diff_motion_probability_conditional"], 0.0)
             self.assertGreater(report["max_abs_diff_segment_probability_conditional"], 0.0)

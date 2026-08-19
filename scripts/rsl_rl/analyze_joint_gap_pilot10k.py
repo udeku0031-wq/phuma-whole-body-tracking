@@ -429,13 +429,12 @@ def _render_report(
         "",
         "## 8. Output files",
         "",
-        f"- {output_dir / 'pilot10k_scalar_windows.csv'}",
-        f"- {output_dir / 'pilot10k_checkpoint_health.csv'}",
-        f"- {output_dir / 'pilot10k_degeneracy.csv'}",
-        f"- {output_dir / 'pilot10k_joint_top6_frequency.csv'}",
-        f"- {output_dir / 'pilot10k_sigma_floor.csv'}",
-        f"- {output_dir / 'pilot10k_runtime.csv'}",
-        f"- {output_dir / 'pilot10k_manifest.json'}",
+        f"- {output_dir / 'training_window_comparison.csv'}",
+        f"- {output_dir / 'joint_gap_trajectory.csv'}",
+        f"- {output_dir / 'joint_top6_frequency.csv'}",
+        f"- {output_dir / 'sampling_concentration.csv'}",
+        f"- {output_dir / 'runtime_performance.csv'}",
+        f"- {output_dir / 'pilot_manifest.json'}",
         "",
         "## 9. STEP 10 gate",
         "",
@@ -471,7 +470,7 @@ def run_analysis(
     selected = _select_checkpoints(run_dir, checkpoints)
     pilot_health = [smoke._checkpoint_health(path, lambda_joint) for path in selected]
     health_rows = [{key: value for key, value in row.items() if not key.startswith("_")} for row in pilot_health]
-    _write_csv(output_dir / "pilot10k_checkpoint_health.csv", health_rows)
+    _write_csv(output_dir / "joint_gap_trajectory.csv", health_rows)
 
     degeneracy_rows = [
         {
@@ -486,7 +485,7 @@ def run_analysis(
         }
         for row in pilot_health
     ]
-    _write_csv(output_dir / "pilot10k_degeneracy.csv", degeneracy_rows)
+    _write_csv(output_dir / "sampling_concentration.csv", degeneracy_rows)
 
     top6_rows: list[dict[str, Any]] = []
     sigma_rows: list[dict[str, Any]] = []
@@ -552,9 +551,9 @@ def run_analysis(
                 "joint_gap_update_count": row["update_count"],
             }
         )
-    _write_csv(output_dir / "pilot10k_joint_top6_frequency.csv", top6_rows)
-    _write_csv(output_dir / "pilot10k_sigma_floor.csv", sigma_rows)
-    _write_csv(output_dir / "pilot10k_runtime.csv", runtime_rows)
+    _write_csv(output_dir / "joint_top6_frequency.csv", top6_rows)
+    _write_csv(output_dir / "sigma_floor_trajectory.csv", sigma_rows)
+    _write_csv(output_dir / "runtime_performance.csv", runtime_rows)
 
     pilot_events = _load_scalars(run_dir)
     reference_events = _load_scalars(reference_run_dir)
@@ -566,7 +565,7 @@ def run_analysis(
         compare_to=reference_events,
         end_step=compare_step,
     )
-    _write_csv(output_dir / "pilot10k_scalar_windows.csv", scalar_rows)
+    _write_csv(output_dir / "training_window_comparison.csv", scalar_rows)
 
     reference_checkpoint = min(reference_run_dir.glob("model_*.pt"), key=lambda path: (abs(_checkpoint_iteration(path) - 10000), _checkpoint_iteration(path)))
     reference_identity = _reference_identity(reference_checkpoint)
@@ -598,7 +597,7 @@ def run_analysis(
         "checkpoints": [row["checkpoint_path"] for row in health_rows],
         "reference": reference_identity,
     }
-    (output_dir / "pilot10k_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    (output_dir / "pilot_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     report = _render_report(
         output_dir=output_dir,
         status=status,
@@ -611,7 +610,7 @@ def run_analysis(
         scalar_rows=scalar_rows,
         latest_step=pilot_latest_step,
     )
-    (output_dir / "pilot10k_report.md").write_text(report, encoding="utf-8")
+    (output_dir / "pilot_training_report.md").write_text(report, encoding="utf-8")
     return manifest
 
 
@@ -639,7 +638,7 @@ def main() -> int:
         final_iteration=args.final_iteration,
     )
     print(f"STEP 9: {manifest['status']}")
-    print(f"report: {Path(args.output_dir) / 'pilot10k_report.md'}")
+    print(f"report: {Path(args.output_dir) / 'pilot_training_report.md'}")
     if manifest["warnings"]:
         print("warnings:")
         for item in manifest["warnings"]:
