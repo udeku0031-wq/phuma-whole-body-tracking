@@ -77,12 +77,17 @@ def _config(method: str) -> SimpleNamespace:
         "M4": ("raw_error", "raw_error"),
         "M5": ("learning_gap", "relative_learning_gap"),
         "M6": ("learning_gap", "relative_learning_gap"),
+        "Q-only": ("raw_error", "raw_error"),
+        "D-only": ("raw_error", "raw_error"),
+        "GlobalRaw": ("uniform", "global_bin_raw_error"),
+        "GlobalRaw-Q": ("uniform", "global_bin_raw_error"),
         "GLOBAL_BIN_RAW_ERROR": ("uniform", "global_bin_raw_error"),
     }
     motion_mode, segment_mode = modes[method]
     adaptive = method not in {"M0", "M1"}
-    quality = method in {"M1", "M6"}
+    quality = method in {"M1", "M6", "Q-only", "GlobalRaw-Q"}
     difficulty = method in {"M5", "M6"}
+    diversity = method == "D-only"
     return SimpleNamespace(
         method_name=method,
         segment=SimpleNamespace(enabled=True, length_seconds=1.0),
@@ -92,7 +97,7 @@ def _config(method: str) -> SimpleNamespace:
             reject_statuses=("reject",),
             include_borderline=True,
             strict_metadata_match=True,
-            empty_motion_policy="exclude" if method == "M6" else "error",
+            empty_motion_policy="exclude" if method in {"M6", "Q-only", "GlobalRaw-Q"} else "error",
             gate_scope="assignment_start",
         ),
         difficulty_calibration=SimpleNamespace(
@@ -150,7 +155,17 @@ def _config(method: str) -> SimpleNamespace:
             success_weight=0.5,
         ),
         online_snapshot=SimpleNamespace(enabled=False),
-        diversity_constraint=SimpleNamespace(enabled=False),
+        diversity_constraint=SimpleNamespace(
+            enabled=diversity,
+            metadata_path="clusters.npz" if diversity else "",
+            strict_metadata_match=True,
+            expected_num_clusters=8,
+            budget_mode="sqrt_size_with_floor",
+            minimum_budget_fraction_of_uniform=0.5,
+            cluster_size_exponent=0.5,
+            diversity_during_warmup=True,
+            count_aware_correction=False,
+        ),
         motion_sampling=SimpleNamespace(mode=motion_mode),
         segment_sampling=SimpleNamespace(mode=segment_mode),
         sampling_statistics=SimpleNamespace(enabled=True, log_interval=100),
@@ -162,9 +177,57 @@ def _config(method: str) -> SimpleNamespace:
 class ModeValidationTest(unittest.TestCase):
     def test_m0_through_m6_and_global_bin_contracts(self) -> None:
         validate = _validator()
-        for method in ("M0", "M1", "M2", "M3", "M4", "M5", "M6", "GLOBAL_BIN_RAW_ERROR"):
+        for method in (
+            "M0",
+            "M1",
+            "M2",
+            "M3",
+            "M4",
+            "M5",
+            "M6",
+            "Q-only",
+            "D-only",
+            "GlobalRaw",
+            "GlobalRaw-Q",
+            "GLOBAL_BIN_RAW_ERROR",
+        ):
             with self.subTest(method=method):
                 validate(_config(method))
+
+    def test_final_paper_minimal_ablation_contracts_are_strict(self) -> None:
+        validate = _validator()
+
+        q_only = _config("Q-only")
+        validate(q_only)
+        q_only.quality_gate.enabled = False
+        with self.assertRaisesRegex(ValueError, "requires quality_gate.enabled=True"):
+            validate(q_only)
+
+        d_only = _config("D-only")
+        validate(d_only)
+        d_only.diversity_constraint.enabled = False
+        with self.assertRaisesRegex(ValueError, "requires diversity_constraint.enabled=True"):
+            validate(d_only)
+
+        global_raw = _config("GlobalRaw")
+        validate(global_raw)
+        self.assertFalse(global_raw.quality_gate.enabled)
+        self.assertFalse(global_raw.difficulty_calibration.enabled)
+        self.assertFalse(global_raw.diversity_constraint.enabled)
+        self.assertEqual(global_raw.motion_sampling.mode, "uniform")
+        self.assertEqual(global_raw.segment_sampling.mode, "global_bin_raw_error")
+
+        global_raw.quality_gate.enabled = True
+        global_raw.quality_gate.metadata_path = "quality.npz"
+        with self.assertRaisesRegex(ValueError, "requires quality_gate.enabled=False"):
+            validate(global_raw)
+
+        global_raw_q = _config("GlobalRaw-Q")
+        validate(global_raw_q)
+        global_raw_q.diversity_constraint.enabled = True
+        global_raw_q.diversity_constraint.metadata_path = "clusters.npz"
+        with self.assertRaisesRegex(ValueError, "Cluster diversity is only valid"):
+            validate(global_raw_q)
 
     def test_learning_gap_requires_difficulty_and_m6_requires_quality_exclude(self) -> None:
         validate = _validator()

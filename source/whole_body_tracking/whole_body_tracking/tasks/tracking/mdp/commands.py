@@ -288,13 +288,18 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
         "M7": ("learning_gap", "relative_learning_gap"),
         "M7-Raw": ("raw_error", "raw_error"),
         "M7-JGap": ("raw_error", "raw_error_joint_gap"),
+        "Q-only": ("raw_error", "raw_error"),
+        "D-only": ("raw_error", "raw_error"),
+        "GlobalRaw": ("uniform", "global_bin_raw_error"),
+        "GlobalRaw-Q": ("uniform", "global_bin_raw_error"),
         "DIVERSITY_ONLY": ("uniform", "uniform"),
         "GLOBAL_BIN_RAW_ERROR": ("uniform", "global_bin_raw_error"),
     }
     if cfg.method_name not in method_modes:
         raise NotImplementedError(
             f"Research method '{cfg.method_name}' is not implemented; use M0--M7, "
-            "M7-Raw, M7-JGap, DIVERSITY_ONLY, or GLOBAL_BIN_RAW_ERROR."
+            "M7-Raw, M7-JGap, Q-only, D-only, GlobalRaw, GlobalRaw-Q, DIVERSITY_ONLY, "
+            "or GLOBAL_BIN_RAW_ERROR."
         )
     known_motion_modes = {"uniform", "raw_error", "learning_gap"}
     known_segment_modes = {
@@ -319,15 +324,29 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
             f"method_name='{cfg.method_name}' requires motion/segment modes {expected_modes}, "
             f"got {actual_modes}."
         )
-    if cfg.method_name in {"M0", "M2", "M3", "M4", "M5", "DIVERSITY_ONLY"} and cfg.quality_gate.enabled:
+    if cfg.method_name in {
+        "M0",
+        "M2",
+        "M3",
+        "M4",
+        "M5",
+        "D-only",
+        "GlobalRaw",
+        "DIVERSITY_ONLY",
+        "GLOBAL_BIN_RAW_ERROR",
+    } and cfg.quality_gate.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires quality_gate.enabled=False.")
-    if cfg.method_name in {"M1", "M6", "M7", "M7-Raw", "M7-JGap"} and not cfg.quality_gate.enabled:
+    if cfg.method_name in {"M1", "M6", "M7", "M7-Raw", "M7-JGap", "Q-only", "GlobalRaw-Q"} and not cfg.quality_gate.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires quality_gate.enabled=True.")
     if cfg.method_name in {
         "M2",
         "M3",
         "M4",
         "M7-Raw",
+        "Q-only",
+        "D-only",
+        "GlobalRaw",
+        "GlobalRaw-Q",
         "DIVERSITY_ONLY",
         "GLOBAL_BIN_RAW_ERROR",
     } and cfg.difficulty_calibration.enabled:
@@ -335,10 +354,13 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
     if cfg.method_name in {"M5", "M6", "M7", "M7-JGap"} and not cfg.difficulty_calibration.enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires difficulty calibration.")
     diversity_enabled = bool(cfg.diversity_constraint.enabled)
-    if cfg.method_name in {"M7", "M7-Raw", "M7-JGap", "DIVERSITY_ONLY"} and not diversity_enabled:
+    if cfg.method_name in {"M7", "M7-Raw", "M7-JGap", "D-only", "DIVERSITY_ONLY"} and not diversity_enabled:
         raise ValueError(f"method_name='{cfg.method_name}' requires diversity_constraint.enabled=True.")
-    if cfg.method_name not in {"M7", "M7-Raw", "M7-JGap", "DIVERSITY_ONLY"} and diversity_enabled:
-        raise ValueError("Cluster diversity is only valid for M7, M7-Raw, M7-JGap, or the DIVERSITY_ONLY diagnostic.")
+    if cfg.method_name not in {"M7", "M7-Raw", "M7-JGap", "D-only", "DIVERSITY_ONLY"} and diversity_enabled:
+        raise ValueError(
+            "Cluster diversity is only valid for M7, M7-Raw, M7-JGap, D-only, "
+            "or the DIVERSITY_ONLY diagnostic."
+        )
     if diversity_enabled:
         diversity = cfg.diversity_constraint
         if not cfg.segment.enabled:
@@ -429,7 +451,7 @@ def _validate_research_config(cfg: ResearchExperimentCfg) -> None:
                 "quality_gate.empty_motion_policy must be one of "
                 f"{sorted(QualityGatedStartIndex._EMPTY_MOTION_POLICIES)}."
             )
-        if cfg.method_name in {"M6", "M7", "M7-JGap"} and cfg.quality_gate.empty_motion_policy != "exclude":
+        if cfg.method_name in {"M6", "M7", "M7-JGap", "Q-only", "GlobalRaw-Q"} and cfg.quality_gate.empty_motion_policy != "exclude":
             raise ValueError(f"{cfg.method_name} requires quality_gate.empty_motion_policy='exclude'.")
 
     if online_cfg is not None:

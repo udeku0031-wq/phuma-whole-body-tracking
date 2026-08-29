@@ -361,6 +361,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
         agent_cfg.device = args_cli.device
+    if args_cli.disable_fabric:
+        env_cfg.sim.use_fabric = False
     if hasattr(env_cfg, "seed"):
         env_cfg.seed = args_cli.seed
     randomization_warnings: list[str] = []

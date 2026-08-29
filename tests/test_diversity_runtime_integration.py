@@ -163,6 +163,44 @@ class DiversityConfigContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires diversity_constraint"):
             validate(cfg)
 
+    def test_final_d_only_contract_uses_diversity_with_raw_error_adaptation(self) -> None:
+        validate = _validator()
+        cfg = _m7_raw_config()
+        cfg.method_name = "D-only"
+        cfg.quality_gate.enabled = False
+        cfg.quality_gate.metadata_path = ""
+        cfg.quality_gate.empty_motion_policy = "error"
+        validate(cfg)
+        self.assertEqual(cfg.motion_sampling.mode, "raw_error")
+        self.assertEqual(cfg.segment_sampling.mode, "raw_error")
+        self.assertTrue(cfg.diversity_constraint.enabled)
+
+        cfg = _m7_raw_config()
+        cfg.method_name = "D-only"
+        cfg.quality_gate.enabled = True
+        with self.assertRaisesRegex(ValueError, "requires quality_gate.enabled=False"):
+            validate(cfg)
+
+    def test_final_global_raw_contract_uses_global_segment_competition_only(self) -> None:
+        validate = _validator()
+        cfg = _m7_raw_config()
+        cfg.method_name = "GlobalRaw"
+        cfg.motion_sampling.mode = "uniform"
+        cfg.segment_sampling.mode = "global_bin_raw_error"
+        cfg.quality_gate.enabled = False
+        cfg.quality_gate.metadata_path = ""
+        cfg.quality_gate.empty_motion_policy = "error"
+        cfg.difficulty_calibration.enabled = False
+        cfg.difficulty_calibration.metadata_path = ""
+        cfg.diversity_constraint.enabled = False
+        cfg.diversity_constraint.metadata_path = ""
+        validate(cfg)
+
+        cfg.diversity_constraint.enabled = True
+        cfg.diversity_constraint.metadata_path = "clusters.npz"
+        with self.assertRaisesRegex(ValueError, "Cluster diversity is only valid"):
+            validate(cfg)
+
     def test_m7_jgap_contract_keeps_generic_gap_off_and_joint_gap_on(self) -> None:
         validate = _validator()
         cfg = _m7_jgap_config()
