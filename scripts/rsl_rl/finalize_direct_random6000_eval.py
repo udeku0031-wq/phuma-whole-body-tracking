@@ -42,6 +42,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--progress-interval", "--progress_interval", dest="progress_interval", type=int, default=50)
     parser.add_argument("--episode-length-s", "--episode_length_s", dest="episode_length_s", type=float, default=60.0)
     parser.add_argument("--device", default=None, help="Optional device forwarded to evaluate.py, e.g. cuda:0.")
+    parser.add_argument("--disable-fabric", "--disable_fabric", dest="disable_fabric", action="store_true")
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--disable-randomization", "--disable_randomization", dest="disable_randomization", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
@@ -141,6 +142,8 @@ def _evaluate_command(
     ]
     if args.device:
         command.extend(["--device", args.device])
+    if args.disable_fabric:
+        command.append("--disable_fabric")
     if args.deterministic:
         command.append("--deterministic")
     if args.disable_randomization:

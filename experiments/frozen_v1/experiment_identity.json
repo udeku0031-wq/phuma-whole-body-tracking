@@ -1,0 +1,65 @@
+{
+  "branch": "research/hierarchical-learning-gap",
+  "cluster_count": 8,
+  "experiment_id": "experiments-v1",
+  "files": {
+    "module1_quality_config": {
+      "path": "configs/quality/g1_segment_quality.yaml",
+      "sha256": "f22e04d97270f55382d48cb874edb6d7df12beb2d052c15efcd7f73c55d00c27"
+    },
+    "module1_quality_metadata": {
+      "path": "outputs/module1_quality_random6000_seed42_original_v1/segment_quality_metadata.npz",
+      "sha256": "0182c17c01f85d14b8d5d0965b539a99069bd6d8d4346ac3b101a3ecef7b9273"
+    },
+    "module1_quality_resolved_config": {
+      "path": "outputs/module1_quality_random6000_seed42_original_v1/quality_config_resolved.json",
+      "sha256": "9847f55e461f5cdf9e541f82105596564977f361cc8e0c30a8409d0ca26cf06d"
+    },
+    "module2_difficulty_config": {
+      "path": "configs/difficulty/g1_segment_difficulty.yaml",
+      "sha256": "05c25892430d2d9fbe937127d547e1fba8ac1b9d21466a5836af86933e6df456"
+    },
+    "module2_difficulty_metadata": {
+      "path": "outputs/module2_difficulty_random6000_seed42_v1/segment_difficulty_metadata.npz",
+      "sha256": "4a59f2ec3231d111794a669272ba7ee431418be6bb1ddd0b55ff51b98f1bb97c"
+    },
+    "module2_difficulty_profile": {
+      "path": "outputs/module2_difficulty_random6000_seed42_v1/difficulty_profile.json",
+      "sha256": "39a1f41f0bc39a38cbcf9797fe32fe88703325d672c278ed670d6615ee9a1c6e"
+    },
+    "module3_online_config": {
+      "path": "configs/online_learning/g1_module3.yaml",
+      "sha256": "fa57e72c36e2e4a93db47dfe5d470690fa2affddfb2fb5a824dda0642d910739"
+    },
+    "module4_cluster_config": {
+      "path": "configs/diversity/g1_motion_clustering.yaml",
+      "sha256": "2e6611e7dceeb2e5bc2a61c5625b5c5632dd62d97758b047911d347f558c5036"
+    },
+    "module4_cluster_metadata": {
+      "path": "outputs/module4_clusters_random6000_seed42_v1/motion_cluster_metadata.npz",
+      "sha256": "43ccf60af2081a010800027c7cfc2d289839b755fd665b0f984a840cf3083b66"
+    },
+    "module4_cluster_profile": {
+      "path": "outputs/module4_clusters_random6000_seed42_v1/cluster_profile.json",
+      "sha256": "fa6ee29a910e1525a38399989aed350af0a62209a03439644f22d60d3b053d07"
+    },
+    "train_manifest": {
+      "path": "PHUMA_wbt_motions/manifests/experiments/random_seed42/random6000_seed42.txt",
+      "sha256": "51f592792f412c5d5e31caf3621162a3b2ef356e05f98dbce43153d08a59e82d"
+    }
+  },
+  "git_commit": "36e82480d8130ab59488034c4b8162721c20b0ce",
+  "manual_review": {
+    "module1_quality": "completed",
+    "module2_difficulty": "completed",
+    "module4_cluster": "completed"
+  },
+  "sampling_seed": 42,
+  "segment_count": 21575,
+  "train_manifest_motion_count": 6000,
+  "training_seeds": [
+    42,
+    43,
+    44
+  ]
+}

@@ -1,0 +1,66 @@
+schema_version: 1
+provisional: true
+provisional_notice: >-
+  Module-three pilot defaults. Freeze only after random100 CPU/Isaac smoke and
+  random6000 Train diagnostics; never tune on Validation or Test.
+
+online_learning:
+  enabled: false
+  statistics_enabled: false
+  warmup_iterations: 1000
+  probability_update_interval: 50
+  ema_decay: 0.95
+  min_segment_observations: 32
+  min_motion_episodes: 8
+  min_bin_valid_segments: 32
+  minimum_segment_observed_fraction: 0.20
+  sigma_floor: 0.10
+  gap_clip: 5.0
+  score_clip: 10.0
+  sampler_seed: 42
+  bin_observation_weighted: false
+
+error_definition:
+  body_position_scale_m: 0.30
+  joint_position_scale_rad: 0.50
+  orientation_scale_rad: 0.40
+  body_weight: 1.0
+  joint_weight: 1.0
+  orientation_weight: 1.0
+  termination_weight: 1.0
+  completion_weight: 0.5
+  success_weight: 0.5
+  component_clip: 5.0
+
+motion_error:
+  segment_mean_weight: 1.0
+  segment_p90_weight: 0.25
+  termination_weight: 0.5
+  completion_weight: 0.5
+  success_weight: 0.5
+
+motion_gap:
+  positive_mean_weight: 1.0
+  positive_p90_weight: 0.5
+  termination_weight: 0.5
+  completion_weight: 0.5
+  success_weight: 0.5
+
+adaptive_sampling:
+  uniform_mix: 0.15
+  temperature: 1.0
+  under_sampling_weight: 0.25
+  motion_probability_cap: 0.02
+  segment_probability_cap: 1.00
+  fallback: uniform
+
+implemented_modes:
+  M0: {motion: uniform, segment: uniform, quality: false, difficulty: false}
+  M1: {motion: uniform, segment: uniform, quality: true, difficulty: false}
+  M2: {motion: raw_error, segment: uniform, quality: false, difficulty: false}
+  M3: {motion: uniform, segment: raw_error, quality: false, difficulty: false}
+  M4: {motion: raw_error, segment: raw_error, quality: false, difficulty: false}
+  M5: {motion: learning_gap, segment: relative_learning_gap, quality: false, difficulty: true}
+  M6: {motion: learning_gap, segment: relative_learning_gap, quality: true, difficulty: true}
+  GLOBAL_BIN_RAW_ERROR:
+    {motion: uniform, segment: global_bin_raw_error, quality: configurable, difficulty: false}

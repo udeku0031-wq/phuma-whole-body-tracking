@@ -33,6 +33,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-envs", "--num_envs", dest="num_envs", type=int, default=16)
     parser.add_argument("--output-root", "--output_root", dest="output_root", required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--disable-fabric", "--disable_fabric", dest="disable_fabric", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--disable-randomization", "--disable_randomization", dest="disable_randomization", action="store_true")
     parser.add_argument("--resume", action="store_true", help="Resume individual checkpoint evaluations.")
@@ -83,6 +84,8 @@ def _evaluate_command(args: argparse.Namespace, checkpoint: Path, output_dir: Pa
         "--seed",
         str(args.seed),
     ]
+    if args.disable_fabric:
+        command.append("--disable_fabric")
     if args.deterministic:
         command.append("--deterministic")
     if args.disable_randomization:

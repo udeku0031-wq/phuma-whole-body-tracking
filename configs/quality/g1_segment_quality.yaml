@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "provisional": true,
+  "provisional_notice": "Conservative pilot defaults. Freeze thresholds only after offline statistics and manual replay review; do not tune them on Validation or Test.",
+  "segment_length_seconds": 1.0,
+  "robot": {
+    "urdf_path": "source/whole_body_tracking/whole_body_tracking/assets/unitree_description/urdf/g1/main.urdf",
+    "limit_source_note": "Joint lower, upper, type, and velocity limits are parsed from this URDF and aligned by NPZ joint_names. Values are never copied into this config."
+  },
+  "root": {
+    "body_name": "pelvis"
+  },
+  "ground": {
+    "z_m": 0.0,
+    "foot_body_names": [
+      "left_ankle_roll_link",
+      "right_ankle_roll_link"
+    ],
+    "sole_local_offsets_m": {
+      "left_ankle_roll_link": [0.04, 0.0, -0.037],
+      "right_ankle_roll_link": [0.04, 0.0, -0.037]
+    },
+    "sole_offset_note": "Local WXYZ-frame offset from each ankle-roll link to the LL_FOOT/LR_FOOT fixed frame in the repository G1 URDF. Keep configurable and verify against replay before freezing the audit.",
+    "require_configured_foot_bodies": true,
+    "contact_height_threshold_m": 0.06,
+    "contact_vertical_speed_threshold_mps": 0.20
+  },
+  "status": {
+    "reject_score_threshold": 0.55,
+    "pass_score_threshold": 0.90,
+    "minimum_optional_metric_coverage": 0.60,
+    "required_metrics": [
+      "nonfinite_values",
+      "quaternion_norm",
+      "joint_position_limits",
+      "joint_velocity_limits",
+      "ground_penetration",
+      "foot_sliding"
+    ],
+    "optional_metric_coverage_profile": [
+      "joint_velocity_consistency",
+      "body_velocity_consistency",
+      "joint_acceleration_spike",
+      "joint_jerk_spike",
+      "root_linear_acceleration_spike",
+      "root_angular_acceleration_spike",
+      "root_position_continuity",
+      "root_orientation_continuity",
+      "body_position_continuity",
+      "body_orientation_continuity",
+      "joint_position_continuity"
+    ],
+    "reject_severity_count": 2,
+    "borderline_on_warning": true
+  },
+  "metrics": {
+    "nonfinite_values": {
+      "unit": "fraction_of_numeric_values",
+      "description": "Fraction of trajectory values that are NaN or Inf.",
+      "warning_threshold": 0.0,
+      "reject_threshold": 1e-12,
+      "weight": 2.0,
+      "hard_at_reject": true
+    },
+    "quaternion_norm": {
+      "unit": "absolute_norm_error",
+      "description": "Maximum absolute error from unit norm across WXYZ body quaternions.",
+      "warning_threshold": 0.005,
+      "reject_threshold": 0.10,
+      "weight": 1.5,
+      "hard_at_reject": true
+    },
+    "joint_position_limits": {
+      "unit": "rad_max_excess",
+      "description": "Maximum excess beyond URDF hard joint position limits.",
+      "warning_threshold": 0.02,
+      "reject_threshold": 0.20,
+      "weight": 1.5,
+      "hard_at_reject": true
+    },
+    "joint_velocity_limits": {
+      "unit": "rad_per_s_max_excess",
+      "description": "Maximum excess beyond URDF joint velocity limits.",
+      "warning_threshold": 1.0,
+      "reject_threshold": 8.0,
+      "weight": 1.0,
+      "hard_at_reject": true
+    },
+    "joint_velocity_consistency": {
+      "unit": "rad_per_s_p95_absolute_error",
+      "description": "P95 difference between full-motion finite-difference joint velocity and stored joint_vel, combined with a max-error channel for sparse corruption.",
+      "warning_threshold": 1.0,
+      "reject_threshold": 8.0,
+      "max_warning_threshold": 4.0,
+      "max_reject_threshold": 20.0,
+      "weight": 1.0,
+      "hard_at_reject": true
+    },
+    "body_velocity_consistency": {
+      "unit": "m_per_s_p95_vector_error",
+      "description": "P95 difference between full-motion finite-difference body position velocity and stored body_lin_vel_w, combined with a max-error channel for sparse corruption.",
+      "warning_threshold": 0.75,
+      "reject_threshold": 5.0,
+      "max_warning_threshold": 3.0,
+      "max_reject_threshold": 15.0,
+      "weight": 0.75,
+      "hard_at_reject": true
+    },
+    "joint_acceleration_spike": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated joint-acceleration peak relative to an absolute floor and neighboring frames; sustained smooth acceleration is not a spike.",
+      "absolute_floor": 500.0,
+      "absolute_floor_unit": "rad_per_s2",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 6.0,
+      "weight": 0.5,
+      "hard_at_reject": false
+    },
+    "joint_jerk_spike": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated joint-jerk peak relative to an absolute floor and neighboring frames.",
+      "absolute_floor": 30000.0,
+      "absolute_floor_unit": "rad_per_s3",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 6.0,
+      "weight": 0.5,
+      "hard_at_reject": false
+    },
+    "root_linear_acceleration_spike": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated root linear-acceleration peak computed from stored full-motion body velocity.",
+      "absolute_floor": 100.0,
+      "absolute_floor_unit": "m_per_s2",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 6.0,
+      "weight": 0.35,
+      "hard_at_reject": false
+    },
+    "root_angular_acceleration_spike": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated root angular-acceleration peak computed from stored full-motion body angular velocity.",
+      "absolute_floor": 200.0,
+      "absolute_floor_unit": "rad_per_s2",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 6.0,
+      "weight": 0.35,
+      "hard_at_reject": false
+    },
+    "root_position_continuity": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated root position transition; physical jump statistics remain in metric details.",
+      "absolute_floor": 0.25,
+      "absolute_floor_unit": "m_per_frame",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 4.0,
+      "weight": 1.0,
+      "hard_at_reject": true
+    },
+    "root_orientation_continuity": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated WXYZ quaternion geodesic root rotation transition; q and -q are equivalent.",
+      "absolute_floor": 0.60,
+      "absolute_floor_unit": "rad_per_frame",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 3.0,
+      "weight": 1.0,
+      "hard_at_reject": true
+    },
+    "body_position_continuity": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated world-frame body position transition.",
+      "absolute_floor": 0.30,
+      "absolute_floor_unit": "m_per_frame",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 4.0,
+      "weight": 0.75,
+      "hard_at_reject": true
+    },
+    "body_orientation_continuity": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated WXYZ quaternion geodesic body rotation transition; q and -q are equivalent.",
+      "absolute_floor": 0.80,
+      "absolute_floor_unit": "rad_per_frame",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 3.0,
+      "weight": 0.75,
+      "hard_at_reject": true
+    },
+    "joint_position_continuity": {
+      "unit": "dimensionless_isolation_ratio",
+      "description": "Isolated joint position transition. Only URDF continuous joints are unwrapped.",
+      "absolute_floor": 0.80,
+      "absolute_floor_unit": "rad_per_frame",
+      "relative_multiplier": 8.0,
+      "warning_threshold": 1.0,
+      "reject_threshold": 3.0,
+      "weight": 1.0,
+      "hard_at_reject": true
+    },
+    "ground_penetration": {
+      "unit": "m_max_depth",
+      "description": "Maximum configured sole reference depth below ground_z.",
+      "warning_threshold": 0.03,
+      "reject_threshold": 0.10,
+      "weight": 1.0,
+      "hard_at_reject": true
+    },
+    "foot_sliding": {
+      "unit": "m_per_s_contact_p95",
+      "description": "P95 horizontal sole speed only while height and vertical-speed tests indicate contact; a separately configured persistent severe-contact rule is hard.",
+      "warning_threshold": 0.80,
+      "reject_threshold": 2.50,
+      "persistent_reject_frame_ratio": 0.25,
+      "persistent_reject_min_contact_samples": 10,
+      "weight": 0.50,
+      "hard_at_reject": false
+    }
+  }
+}

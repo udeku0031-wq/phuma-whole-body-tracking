@@ -1,0 +1,300 @@
+{
+  "schema_version": 1,
+  "algorithm_schema_version": "wbt.intrinsic_difficulty.kinematic_contact.v2",
+  "provisional": true,
+  "provisional_notice": "Fit on Train only and freeze after feature-statistics and replay review. Never tune this profile on Validation or Test.",
+  "segment_length_seconds": 1.0,
+  "num_bins": 10,
+  "robust_scale_epsilon": 1e-6,
+  "near_constant_scale_threshold": 1e-5,
+  "zero_mad_fallback_quantiles": [0.05, 0.95],
+  "zero_mad_fallback_scale_divisor": 3.289707253902945,
+  "robust_clip": 5.0,
+  "minimum_optional_feature_coverage": 0.75,
+  "root_body_name": "pelvis",
+  "hand_body_names": [
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link"
+  ],
+  "foot_body_names": [
+    "left_ankle_roll_link",
+    "right_ankle_roll_link"
+  ],
+  "sole_local_offsets_m": {
+    "left_ankle_roll_link": [0.04, 0.0, -0.037],
+    "right_ankle_roll_link": [0.04, 0.0, -0.037]
+  },
+  "contact": {
+    "ground_z_m": 0.0,
+    "contact_height_threshold_m": 0.06,
+    "release_height_threshold_m": 0.08,
+    "contact_vertical_speed_threshold_mps": 0.20,
+    "release_vertical_speed_threshold_mps": 0.30,
+    "minimum_state_duration_seconds": 0.06,
+    "switch_definition": "sum of debounced left-foot and right-foot boolean transitions, attributed to the destination frame"
+  },
+  "motion_aggregation": {
+    "duration_weighted_mean_weight": 0.5,
+    "segment_p90_weight": 0.5
+  },
+  "future_extensions": [
+    "body_angular_momentum_proxy",
+    "support_margin_proxy",
+    "center_of_mass_height_variation",
+    "torque_sensitivity"
+  ],
+  "features": {
+    "root_linear_speed_mean": {
+      "unit": "m/s",
+      "aggregation": "frame mean of world-frame root linear-speed norm",
+      "required": true,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "root_linear",
+      "description": "Diagnostic mean root translation speed; P95 carries this family's score weight."
+    },
+    "root_linear_speed_p95": {
+      "unit": "m/s",
+      "aggregation": "frame P95 of world-frame root linear-speed norm",
+      "required": true,
+      "direction": 1,
+      "weight": 0.75,
+      "family": "root_linear",
+      "description": "Upper-tail root translation speed."
+    },
+    "root_linear_acceleration_mean": {
+      "unit": "m/s^2",
+      "aggregation": "frame mean of full-motion root linear-acceleration vector norm",
+      "required": true,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "root_linear_acceleration",
+      "description": "Diagnostic mean root linear acceleration; P95 carries this family's score weight."
+    },
+    "root_linear_acceleration_p95": {
+      "unit": "m/s^2",
+      "aggregation": "frame P95 of full-motion root linear-acceleration vector norm",
+      "required": true,
+      "direction": 1,
+      "weight": 0.75,
+      "family": "root_linear_acceleration",
+      "description": "Upper-tail root linear acceleration."
+    },
+    "root_angular_speed_mean": {
+      "unit": "rad/s",
+      "aggregation": "frame mean of relative-WXYZ-quaternion rotation-vector speed norm",
+      "required": true,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "root_angular",
+      "description": "Diagnostic mean root rotation speed; q and -q are equivalent."
+    },
+    "root_angular_speed_p95": {
+      "unit": "rad/s",
+      "aggregation": "frame P95 of relative-WXYZ-quaternion rotation-vector speed norm",
+      "required": true,
+      "direction": 1,
+      "weight": 0.75,
+      "family": "root_angular",
+      "description": "Upper-tail root rotation speed from quaternion relative rotations."
+    },
+    "root_angular_acceleration_mean": {
+      "unit": "rad/s^2",
+      "aggregation": "frame mean of full-motion angular-velocity-vector derivative norm",
+      "required": true,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "root_angular_acceleration",
+      "description": "Diagnostic mean root angular acceleration."
+    },
+    "root_angular_acceleration_p95": {
+      "unit": "rad/s^2",
+      "aggregation": "frame P95 of full-motion angular-velocity-vector derivative norm",
+      "required": true,
+      "direction": 1,
+      "weight": 0.75,
+      "family": "root_angular_acceleration",
+      "description": "Upper-tail root angular acceleration."
+    },
+    "joint_speed_mean": {
+      "unit": "rad/s",
+      "aggregation": "mean across frames and joints of absolute stored joint velocity",
+      "required": true,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "joint_speed",
+      "description": "Diagnostic mean generalized joint speed."
+    },
+    "joint_speed_p95": {
+      "unit": "rad/s",
+      "aggregation": "P95 across frames and joints of absolute stored joint velocity",
+      "required": true,
+      "direction": 1,
+      "weight": 0.75,
+      "family": "joint_speed",
+      "description": "Upper-tail generalized joint speed."
+    },
+    "joint_acceleration_mean": {
+      "unit": "rad/s^2",
+      "aggregation": "mean across frames and joints of full-motion joint-velocity derivative magnitude",
+      "required": true,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "joint_acceleration",
+      "description": "Diagnostic mean joint acceleration."
+    },
+    "joint_acceleration_p95": {
+      "unit": "rad/s^2",
+      "aggregation": "P95 across frames and joints of full-motion joint-velocity derivative magnitude",
+      "required": true,
+      "direction": 1,
+      "weight": 0.75,
+      "family": "joint_acceleration",
+      "description": "Upper-tail joint acceleration."
+    },
+    "joint_range_mean": {
+      "unit": "rad",
+      "aggregation": "mean across joints of within-segment max-minus-min position",
+      "required": true,
+      "direction": 1,
+      "weight": 0.5,
+      "family": "joint_range",
+      "description": "Typical joint excursion within the segment."
+    },
+    "joint_range_p90": {
+      "unit": "rad",
+      "aggregation": "P90 across joints of within-segment max-minus-min position",
+      "required": true,
+      "direction": 1,
+      "weight": 0.5,
+      "family": "joint_range",
+      "description": "Upper-tail joint excursion within the segment."
+    },
+    "body_height_mean": {
+      "unit": "m",
+      "aggregation": "frame mean of configured root body world height",
+      "required": true,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "body_height",
+      "description": "Diagnostic posture height; low height alone is not defined as difficult."
+    },
+    "body_height_range": {
+      "unit": "m",
+      "aggregation": "within-segment max-minus-min configured root body world height",
+      "required": true,
+      "direction": 1,
+      "weight": 0.5,
+      "family": "body_height",
+      "description": "Vertical travel of the root body."
+    },
+    "body_height_std": {
+      "unit": "m",
+      "aggregation": "frame standard deviation of configured root body world height",
+      "required": true,
+      "direction": 1,
+      "weight": 0.5,
+      "family": "body_height",
+      "description": "Variation of the root body height."
+    },
+    "hand_speed_p95": {
+      "unit": "m/s",
+      "aggregation": "P95 across frames and configured hand-link world speed norms",
+      "required": false,
+      "direction": 1,
+      "weight": 0.5,
+      "family": "end_effector",
+      "description": "Upper-tail hand-link dynamics."
+    },
+    "foot_swing_speed_p95": {
+      "unit": "m/s",
+      "aggregation": "P95 configured sole-point world speed on debounced non-contact frames; zero when no swing frames exist",
+      "required": false,
+      "direction": 1,
+      "weight": 0.5,
+      "family": "end_effector",
+      "description": "Swing-foot dynamics; contact foot sliding is not used."
+    },
+    "end_effector_speed_mean": {
+      "unit": "m/s",
+      "aggregation": "mean across frames, hands, and sole-point world speed norms",
+      "required": false,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "end_effector",
+      "description": "Diagnostic overall world-frame end-effector dynamics."
+    },
+    "end_effector_speed_p95": {
+      "unit": "m/s",
+      "aggregation": "P95 across frames, hands, and sole-point world speed norms",
+      "required": false,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "end_effector",
+      "description": "Diagnostic upper-tail overall end-effector dynamics."
+    },
+    "double_support_ratio": {
+      "unit": "frame_fraction",
+      "aggregation": "fraction of frames with both feet in debounced candidate contact",
+      "required": false,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "support",
+      "description": "Diagnostic stable-support fraction; not directly scored."
+    },
+    "single_support_ratio": {
+      "unit": "frame_fraction",
+      "aggregation": "fraction of frames with exactly one foot in debounced candidate contact",
+      "required": false,
+      "direction": 1,
+      "weight": 0.65,
+      "family": "support",
+      "description": "Balance demand from single-foot support."
+    },
+    "flight_ratio": {
+      "unit": "frame_fraction",
+      "aggregation": "fraction of frames with neither foot in debounced candidate contact",
+      "required": false,
+      "direction": 1,
+      "weight": 0.65,
+      "family": "support",
+      "description": "Airborne fraction inferred from the reference trajectory."
+    },
+    "left_contact_ratio": {
+      "unit": "frame_fraction",
+      "aggregation": "fraction of frames with left-foot candidate contact",
+      "required": false,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "support",
+      "description": "Diagnostic left-foot contact fraction."
+    },
+    "right_contact_ratio": {
+      "unit": "frame_fraction",
+      "aggregation": "fraction of frames with right-foot candidate contact",
+      "required": false,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "support",
+      "description": "Diagnostic right-foot contact fraction."
+    },
+    "contact_switch_count": {
+      "unit": "count",
+      "aggregation": "sum of full-motion debounced left/right contact transitions assigned to frames in the segment",
+      "required": false,
+      "direction": 1,
+      "weight": 0.0,
+      "family": "contact_transition",
+      "description": "Diagnostic switch count; rate carries this family's score weight."
+    },
+    "contact_switch_rate_per_second": {
+      "unit": "1/s",
+      "aggregation": "contact switch count divided by actual segment duration",
+      "required": false,
+      "direction": 1,
+      "weight": 0.7,
+      "family": "contact_transition",
+      "description": "Debounced contact-transition frequency."
+    }
+  }
+}
