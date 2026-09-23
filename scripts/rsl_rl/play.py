@@ -24,6 +24,30 @@ parser.add_argument("--registry_name", type=str, default=None, help="The name of
 parser.add_argument("--max_steps", type=int, default=None, help="Maximum number of replay steps before exiting.")
 parser.add_argument("--progress_interval", type=int, default=200, help="Print progress every N replay steps.")
 parser.add_argument("--skip_export", action="store_true", help="Skip ONNX export during play.")
+parser.add_argument(
+    "--video_output_dir",
+    type=str,
+    default=None,
+    help="Optional directory for RecordVideo output. Defaults to the checkpoint run's videos/play folder.",
+)
+parser.add_argument(
+    "--disable_motion_debug_vis",
+    action="store_true",
+    help="Hide motion command frame markers in play videos.",
+)
+parser.add_argument(
+    "--disable_contact_debug_vis",
+    action="store_true",
+    help="Hide contact sensor debug markers in play videos.",
+)
+parser.add_argument(
+    "--viewer_eye",
+    type=float,
+    nargs=3,
+    default=None,
+    metavar=("X", "Y", "Z"),
+    help="Viewer camera eye offset used by Isaac Lab's rgb_array renderer.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -77,6 +101,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
         agent_cfg.device = args_cli.device
+    if args_cli.disable_fabric:
+        env_cfg.sim.use_fabric = False
+    if args_cli.disable_motion_debug_vis and hasattr(env_cfg.commands, "motion"):
+        env_cfg.commands.motion.debug_vis = False
+    if args_cli.disable_contact_debug_vis and hasattr(env_cfg.scene, "contact_forces"):
+        env_cfg.scene.contact_forces.debug_vis = False
+    if args_cli.viewer_eye is not None:
+        env_cfg.viewer.eye = tuple(args_cli.viewer_eye)
+        env_cfg.viewer.origin_type = "asset_root"
+        env_cfg.viewer.asset_name = "robot"
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -137,8 +171,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap for video recording
     if args_cli.video:
+        video_folder = args_cli.video_output_dir if args_cli.video_output_dir is not None else os.path.join(log_dir, "videos", "play")
         video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
+            "video_folder": video_folder,
             "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
